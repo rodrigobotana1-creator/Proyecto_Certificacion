@@ -1,0 +1,9 @@
+pandas
+openpyxl
+pdfplumber
+PyMuPDF
+pytesseract
+pillow
+opencv-python
+PyQt5
+qtawesome
