@@ -415,6 +415,126 @@ def _cargar_pixmaps_pdf(ruta):
         return []
 
 
+def _contar_bloques_en_pixmap(
+    pm,
+    umbral_blanco=245,
+    min_filas_blanco=1,
+    min_filas_contenido=100,
+    ignorar_bordes_pct=0.03,
+):
+    """Cuenta cuántos 'bloques' de contenido (fotos) hay en un QPixmap.
+
+    Parámetros calibrados para:
+    - Detectar fotos separadas por espacios blancos finos (~10px).
+    - Ignorar bloques de texto (títulos, leyendas) que ocupan pocas filas.
+    - Ignorar posibles encabezados/pies de página muy cerca de los bordes.
+
+    Regla clave: solo se considera 'foto' un bloque que tenga
+    al menos `min_filas_contenido` filas de contenido. El texto, por
+    más que sea grande, ocupa pocas filas verticales y queda descartado.
+    """
+    if pm is None or pm.isNull():
+        return 0
+
+    img = pm.toImage().convertToFormat(QImage.Format_RGB888)
+    ancho = img.width()
+    alto = img.height()
+    if ancho <= 0 or alto <= 0:
+        return 0
+
+    # Ignorar franjas de borde (encabezado/pie)
+    margen = int(alto * ignorar_bordes_pct)
+    y_ini = margen
+    y_fin = alto - margen
+    if y_fin <= y_ini:
+        y_ini = 0
+        y_fin = alto
+
+    # Para cada fila, ver si tiene contenido
+    filas_con_contenido = []
+    for y in range(y_ini, y_fin):
+        tiene_contenido = False
+        for x in range(0, ancho, 4):
+            pixel = img.pixel(x, y)
+            r = (pixel >> 16) & 0xFF
+            g = (pixel >> 8) & 0xFF
+            b = pixel & 0xFF
+            if r < umbral_blanco or g < umbral_blanco or b < umbral_blanco:
+                tiene_contenido = True
+                break
+        filas_con_contenido.append(tiene_contenido)
+
+    # Detectar bloques
+    bloques = []
+    en_bloque = False
+    inicio_bloque = 0
+    filas_blanco_actual = 0
+
+    for i, tiene in enumerate(filas_con_contenido):
+        if tiene:
+            if not en_bloque:
+                en_bloque = True
+                inicio_bloque = i
+            filas_blanco_actual = 0
+        else:
+            filas_blanco_actual += 1
+            if en_bloque and filas_blanco_actual >= min_filas_blanco:
+                bloques.append((inicio_bloque, i - filas_blanco_actual))
+                en_bloque = False
+                filas_blanco_actual = 0
+
+    if en_bloque:
+        bloques.append((inicio_bloque, len(filas_con_contenido) - 1))
+
+    # Filtrar bloques muy chicos (probablemente texto, no fotos)
+    bloques_filtrados = []
+    for (ini, fin) in bloques:
+        alto_bloque = fin - ini + 1
+        if alto_bloque >= min_filas_contenido:
+            bloques_filtrados.append((ini, fin))
+
+    return len(bloques_filtrados)
+
+
+def _contar_paginas_totales(rutas, detectar_bloques=False):
+    """Cuenta la cantidad total de páginas/imágenes que van a mostrarse.
+
+    Si detectar_bloques=True, para cada página de PDF se analiza el
+    contenido y se cuentan los 'bloques' separados por espacio blanco.
+    Si es False, se cuenta cada página como 1.
+    """
+    total = 0
+    for ruta in rutas:
+        ext = os.path.splitext(ruta)[1].lower()
+        if ext in EXT_IMAGENES:
+            total += 1
+        elif ext == ".pdf" and PYMUPDF_OK:
+            try:
+                doc = fitz.open(ruta)
+                for i in range(doc.page_count):
+                    if not detectar_bloques:
+                        total += 1
+                    else:
+                        pagina = doc.load_page(i)
+                        # Resolución baja para análisis rápido
+                        mat = fitz.Matrix(1.0, 1.0)
+                        pix = pagina.get_pixmap(matrix=mat, alpha=False)
+                        img = QImage(
+                            pix.samples,
+                            pix.width,
+                            pix.height,
+                            pix.stride,
+                            QImage.Format_RGB888,
+                        )
+                        pm = QPixmap.fromImage(img.copy())
+                        cant = _contar_bloques_en_pixmap(pm)
+                        total += max(1, cant)
+                doc.close()
+            except Exception:
+                pass
+    return total
+
+
 def _cargar_todas_las_paginas(ruta):
     ext = os.path.splitext(ruta)[1].lower()
     if ext in EXT_IMAGENES:
@@ -1086,7 +1206,6 @@ class CeldaFoto(QScrollArea):
         self._notificar_zoom()
 
     def zoom_set(self, valor_porcentaje):
-        """Fija el zoom a un valor exacto (en porcentaje, ej: 80 para 80%)."""
         try:
             pct = float(valor_porcentaje)
         except (TypeError, ValueError):
@@ -1620,14 +1739,14 @@ class VistaFotos(QDialog):
         self.splitter_acta_todo.setHandleWidth(10)
         vat.addWidget(self.splitter_acta_todo)
 
-        # -------- Columna 1: ACTA (destacada) --------
+        # -------- Columna 1: ACTA (gris, sin azul) --------
         self.col_acta_frame = QFrame()
         self.col_acta_frame.setObjectName("ColActaDestacada")
         self.col_acta_frame.setMinimumWidth(400)
         self.col_acta_frame.setStyleSheet(f"""
             QFrame#ColActaDestacada {{
-                background-color: {ACCENT_BG};
-                border: 2px solid {ACCENT};
+                background-color: {CARD_2};
+                border: 2px solid {BORDER_2};
                 border-radius: 10px;
             }}
         """)
@@ -1640,20 +1759,20 @@ class VistaFotos(QDialog):
         header_acta.setSpacing(8)
 
         ico_acta = QLabel()
-        ico_acta.setPixmap(_make_icon("fa5s.file-pdf", ACCENT).pixmap(16, 16))
+        ico_acta.setPixmap(_make_icon("fa5s.file-pdf", TEXT).pixmap(16, 16))
         ico_acta.setStyleSheet("background: transparent;")
         header_acta.addWidget(ico_acta)
 
         lbl_acta = QLabel("ACTA")
         lbl_acta.setStyleSheet(
-            f"color: {ACCENT}; font-size: 12pt; font-weight: 800; "
+            f"color: {TEXT}; font-size: 12pt; font-weight: 800; "
             f"background: transparent; letter-spacing: 1px;"
         )
         header_acta.addWidget(lbl_acta)
 
         self.lbl_acta_todo_num = QLabel("")
         self.lbl_acta_todo_num.setStyleSheet(
-            f"color: {ACCENT}; font-size: 10pt; font-weight: 600; "
+            f"color: {TEXT}; font-size: 10pt; font-weight: 600; "
             f"background: transparent;"
         )
         header_acta.addWidget(self.lbl_acta_todo_num)
@@ -1714,30 +1833,18 @@ class VistaFotos(QDialog):
 
         self.splitter_acta_todo.addWidget(self.col_acta_frame)
 
-        frame_came = self._build_columna_foto(
+        # -------- Columna 2: CAME (con zoom) --------
+        frame_came = self._build_columna_foto_con_zoom(
             titulo="CAME", color="#B45309", icono="fa5s.camera"
         )
-        flc = frame_came.layout()
-        self.col_came_todo = ColumnaImagenes([], titulo="", color_titulo="#B45309")
-        self.col_came_todo.lbl_titulo.setVisible(False)
-        self.col_came_todo.btn_zoom_out.setVisible(False)
-        self.col_came_todo.lbl_zoom.setVisible(False)
-        self.col_came_todo.btn_zoom_in.setVisible(False)
-        self.col_came_todo.btn_zoom_reset.setVisible(False)
-        flc.addWidget(self.col_came_todo, 1)
+        self.col_came_todo = frame_came.col_imagenes
         self.splitter_acta_todo.addWidget(frame_came)
 
-        frame_care = self._build_columna_foto(
+        # -------- Columna 3: CARE (con zoom) --------
+        frame_care = self._build_columna_foto_con_zoom(
             titulo="CARE", color=ACCENT, icono="fa5s.camera"
         )
-        flr = frame_care.layout()
-        self.col_care_todo = ColumnaImagenes([], titulo="", color_titulo=ACCENT)
-        self.col_care_todo.lbl_titulo.setVisible(False)
-        self.col_care_todo.btn_zoom_out.setVisible(False)
-        self.col_care_todo.lbl_zoom.setVisible(False)
-        self.col_care_todo.btn_zoom_in.setVisible(False)
-        self.col_care_todo.btn_zoom_reset.setVisible(False)
-        flr.addWidget(self.col_care_todo, 1)
+        self.col_care_todo = frame_care.col_imagenes
         self.splitter_acta_todo.addWidget(frame_care)
 
         self.splitter_acta_todo.setSizes([600, 350, 350])
@@ -1749,7 +1856,7 @@ class VistaFotos(QDialog):
         self.splitter_acta_todo.setCollapsible(1, False)
         self.splitter_acta_todo.setCollapsible(2, False)
 
-    def _build_columna_foto(self, titulo, color, icono="fa5s.camera"):
+    def _build_columna_foto_con_zoom(self, titulo, color, icono="fa5s.camera"):
         frame = QFrame()
         frame.setStyleSheet(f"""
             QFrame {{
@@ -1764,7 +1871,7 @@ class VistaFotos(QDialog):
 
         header = QHBoxLayout()
         header.setContentsMargins(4, 0, 4, 0)
-        header.setSpacing(8)
+        header.setSpacing(6)
 
         ico = QLabel()
         ico.setPixmap(_make_icon(icono, color).pixmap(15, 15))
@@ -1780,9 +1887,69 @@ class VistaFotos(QDialog):
 
         header.addStretch(1)
 
+        col = ColumnaImagenes([], titulo="", color_titulo=color)
+        col.lbl_titulo.setVisible(False)
+        col.btn_zoom_out.setVisible(False)
+        col.lbl_zoom.setVisible(False)
+        col.btn_zoom_in.setVisible(False)
+        col.btn_zoom_reset.setVisible(False)
+
+        btn_zoom_out = QPushButton()
+        btn_zoom_out.setObjectName("Nav")
+        btn_zoom_out.setIcon(_make_icon("fa5s.search-minus", "#374151"))
+        btn_zoom_out.setIconSize(QSize(11, 11))
+        btn_zoom_out.setCursor(Qt.PointingHandCursor)
+        btn_zoom_out.setToolTip("Alejar (Ctrl + -)")
+        header.addWidget(btn_zoom_out)
+
+        lbl_zoom = QLabel("100%")
+        lbl_zoom.setAlignment(Qt.AlignCenter)
+        lbl_zoom.setFixedWidth(48)
+        lbl_zoom.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 8.5pt; font-weight: 700; "
+            f"background: transparent;"
+        )
+        header.addWidget(lbl_zoom)
+
+        btn_zoom_in = QPushButton()
+        btn_zoom_in.setObjectName("Nav")
+        btn_zoom_in.setIcon(_make_icon("fa5s.search-plus", "#374151"))
+        btn_zoom_in.setIconSize(QSize(11, 11))
+        btn_zoom_in.setCursor(Qt.PointingHandCursor)
+        btn_zoom_in.setToolTip("Acercar (Ctrl + +)")
+        header.addWidget(btn_zoom_in)
+
+        btn_zoom_reset = QPushButton("  Ajustar")
+        btn_zoom_reset.setObjectName("Secondary")
+        btn_zoom_reset.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
+        btn_zoom_reset.setIconSize(QSize(11, 11))
+        btn_zoom_reset.setCursor(Qt.PointingHandCursor)
+        btn_zoom_reset.setToolTip("Ajustar al ancho (Ctrl + 0)")
+        header.addWidget(btn_zoom_reset)
+
         layout.addLayout(header)
 
+        col.lbl_zoom = lbl_zoom
+
+        btn_zoom_out.clicked.connect(col.zoom_out)
+        btn_zoom_in.clicked.connect(col.zoom_in)
+        btn_zoom_reset.clicked.connect(col.zoom_reset)
+
+        btn_zoom_out.clicked.connect(lambda: self._refrescar_lbl_zoom_col(col))
+        btn_zoom_in.clicked.connect(lambda: self._refrescar_lbl_zoom_col(col))
+        btn_zoom_reset.clicked.connect(lambda: self._refrescar_lbl_zoom_col(col))
+
+        layout.addWidget(col, 1)
+
+        frame.col_imagenes = col
         return frame
+
+    def _refrescar_lbl_zoom_col(self, col):
+        try:
+            pct = int(round(col._zoom_base_actual() * 100))
+            col.lbl_zoom.setText(f"{pct}%")
+        except Exception:
+            pass
 
     def _zoom_in_acta_todo(self):
         self.acta_visor.zoom_in()
@@ -1957,9 +2124,14 @@ class VistaFotos(QDialog):
         self._actualizar_boton_modo()
         self._actualizar_boton_maps()
 
+        # CAME: detecta bloques dentro de cada página (para contar imágenes separadas)
+        # CARE: cuenta páginas/archivos normales
+        cant_came = _contar_paginas_totales(self.rutas_came, detectar_bloques=True)
+        cant_care = _contar_paginas_totales(self.rutas_care, detectar_bloques=False)
+
         self._titulo_lbl.setText(
             f"ACTA {self.numero_acta_actual}  ·  "
-            f"CAME: {len(self.rutas_came)}  ·  CARE: {len(self.rutas_care)}"
+            f"CAME: {cant_came}  ·  CARE: {cant_care}"
         )
         try:
             self.lbl_acta_todo_num.setText(f"· N° {self.numero_acta_actual}")
@@ -4242,7 +4414,9 @@ class ComparadorWindow(QMainWindow):
         cant_total = len(care) + len(came)
         if cant_total:
             v.addWidget(_titulo_seccion(
-                f"DOCUMENTOS DEL ACTA  ·  CAME: {len(came)}  ·  CARE: {len(care)}"
+                f"DOCUMENTOS DEL ACTA  ·  "
+                f"CAME: {_contar_paginas_totales(came, detectar_bloques=True)}  ·  "
+                f"CARE: {_contar_paginas_totales(care, detectar_bloques=False)}"
             ))
         else:
             v.addWidget(_titulo_seccion("DOCUMENTOS DEL ACTA"))
