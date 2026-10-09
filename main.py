@@ -4,6 +4,8 @@ import re
 import base64
 import platform
 import subprocess
+import urllib.parse
+import webbrowser
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
@@ -65,7 +67,6 @@ from modules.batch_loader import (
     _solo_numero_acta,
     _normalizar_id,
 )
-from modules.report import generar_reporte
 
 
 BG          = "#F1F3F7"
@@ -79,9 +80,6 @@ TEXT_DIM    = "#98A2B3"
 ACCENT      = "#2563EB"
 ACCENT_H    = "#1D4ED8"
 ACCENT_BG   = "#EFF6FF"
-
-NEGRO_BTN   = "#1F2937"
-NEGRO_BTN_H = "#111827"
 
 OK_BG       = "#ECFDF5"
 OK_FG       = "#065F46"
@@ -187,9 +185,6 @@ def _extraer_imagenes_de_html(ruta_html):
 
 
 def _clasificar_archivo(ruta):
-    """
-    Devuelve 'care', 'came' o None según el NOMBRE del archivo.
-    """
     nombre = os.path.basename(ruta).lower()
     if "care" in nombre:
         return "care"
@@ -199,13 +194,10 @@ def _clasificar_archivo(ruta):
 
 
 def _es_archivo_analizable(ruta):
-    """
-    True si el archivo debe analizarse (no es html ni txt).
-    """
     ext = os.path.splitext(ruta)[1].lower()
     if ext in EXT_HTML:
         return False
-    if ext in (".txt", ".rtf"):  # txt y rtf fuera
+    if ext in (".txt", ".rtf"):
         return False
     if ext in EXT_VALIDAS:
         return True
@@ -287,6 +279,73 @@ def _abrir_con_sistema(ruta):
         return False
 
 
+def _abrir_en_maps(calle, altura=None):
+    if not calle:
+        return False
+
+    partes = [str(calle).strip()]
+    if altura:
+        partes.append(str(altura).strip())
+    partes.append("CABA")
+    partes.append("Buenos Aires")
+    partes.append("Argentina")
+
+    query = ", ".join(p for p in partes if p)
+    url = "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote_plus(query)
+
+    try:
+        webbrowser.open(url)
+        return True
+    except Exception:
+        return False
+
+
+def _calle_altura_de_resultado(r):
+    if not r:
+        return None, None
+
+    calle = None
+    altura = None
+
+    datos_pdf = r.get("datos_pdf") or {}
+    pdf_calle = (datos_pdf.get("calle") or "").strip()
+    pdf_alturas = datos_pdf.get("alturas") or []
+
+    if pdf_calle:
+        calle = pdf_calle
+
+    if pdf_alturas:
+        a = pdf_alturas[0]
+        ini_s = str(a.get("ini", "")).strip()
+        fin_s = str(a.get("fin", "")).strip()
+        try:
+            ini = int(ini_s)
+            fin = int(fin_s)
+            altura = (ini + fin) // 2
+        except Exception:
+            try:
+                altura = int(ini_s)
+            except Exception:
+                altura = None
+
+    if not calle or altura is None:
+        df_acta = r.get("df_acta")
+        fila0 = None
+        if df_acta is not None and not df_acta.empty:
+            fila0 = df_acta.iloc[0]
+
+        if fila0 is not None:
+            if not calle:
+                texto_dir = str(fila0.get(COL_DENOMINACION, "")).strip()
+                calle = texto_dir
+            if altura is None:
+                m = re.search(r"(\d+)\s*$", str(calle) if calle else "")
+                if m:
+                    altura = int(m.group(1))
+
+    return calle, altura
+
+
 def _es_imagen(ruta):
     ext = os.path.splitext(ruta)[1].lower()
     return ext in EXT_IMAGENES
@@ -357,12 +416,6 @@ def _cargar_pixmaps_pdf(ruta):
 
 
 def _cargar_todas_las_paginas(ruta):
-    """
-    Devuelve una lista de QPixmap:
-    - PDF: todas las páginas.
-    - Imagen: una sola.
-    - Otro: [].
-    """
     ext = os.path.splitext(ruta)[1].lower()
     if ext in EXT_IMAGENES:
         pm = QPixmap(ruta)
@@ -824,11 +877,90 @@ class TablaFiltrable(QWidget):
             self.proxy.set_filtro_columna(columna, valores)
 
 
-class CeldaFoto(QScrollArea):
-    def __init__(self, ruta, parent=None):
+class ZoomSpin(QLineEdit):
+    """Campo de texto que muestra y permite escribir el % exacto de zoom."""
+
+    def __init__(self, celda_getter, aplicar_fn, ancho=60, parent=None):
         super().__init__(parent)
-        self.ruta = ruta
-        self.rotacion = _get_rotacion(ruta)
+        self.celda_getter = celda_getter
+        self.aplicar_fn = aplicar_fn
+        self.setFixedWidth(ancho)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {CARD};
+                color: {TEXT};
+                border: 1px solid {BORDER_2};
+                border-radius: 5px;
+                padding: 3px 4px;
+                font-size: 9pt;
+                font-weight: 700;
+            }}
+            QLineEdit:focus {{
+                border-color: {ACCENT};
+                background-color: {ACCENT_BG};
+            }}
+        """)
+        self.setToolTip("Escribí un % y apretá Enter (ej: 80)")
+        self.returnPressed.connect(self._aplicar_escrito)
+        self.editingFinished.connect(self._al_perder_foco)
+        self.actualizar_texto()
+
+    def actualizar_texto(self):
+        if self.hasFocus() and self.isModified():
+            return
+        try:
+            celda = self.celda_getter()
+            if celda is not None:
+                pct = celda.porcentaje_actual()
+                self.blockSignals(True)
+                self.setText(str(pct))
+                self.blockSignals(False)
+                self.setModified(False)
+        except Exception:
+            pass
+
+    def _aplicar_escrito(self):
+        texto = self.text().strip().replace("%", "").replace(",", ".")
+        if not texto:
+            self.actualizar_texto()
+            return
+        try:
+            valor = float(texto)
+        except ValueError:
+            self.actualizar_texto()
+            return
+        if valor <= 0:
+            self.actualizar_texto()
+            return
+        celda = self.celda_getter()
+        if celda is not None:
+            celda.zoom_set(valor)
+        self.aplicar_fn()
+        self.setModified(False)
+
+    def _al_perder_foco(self):
+        self.actualizar_texto()
+        self.setModified(False)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        QTimer.singleShot(0, self.selectAll)
+
+
+class CeldaFoto(QScrollArea):
+    def __init__(self, ruta_o_pixmap, parent=None, ajustar_al_alto=False):
+        super().__init__(parent)
+        self.ajustar_al_alto = ajustar_al_alto
+
+        if isinstance(ruta_o_pixmap, QPixmap):
+            self.ruta = None
+            self._pm_inicial = ruta_o_pixmap
+        else:
+            self.ruta = ruta_o_pixmap
+            self._pm_inicial = None
+
+        self.rotacion = _get_rotacion(self.ruta) if self.ruta else 0
         self.pixmaps = []
         self.zoom = None
 
@@ -870,6 +1002,10 @@ class CeldaFoto(QScrollArea):
             if w:
                 w.deleteLater()
         self.pixmaps = []
+
+        if self._pm_inicial is not None:
+            self._agregar_pagina(self._pm_inicial)
+            return
 
         if _es_imagen(self.ruta):
             pm = QPixmap(self.ruta)
@@ -918,24 +1054,47 @@ class CeldaFoto(QScrollArea):
         self._aplicar_zoom()
 
     def rotar(self):
-        self.rotacion = (self.rotacion + 90) % 360
-        _set_rotacion(self.ruta, self.rotacion)
+        if self.ruta:
+            self.rotacion = (self.rotacion + 90) % 360
+            _set_rotacion(self.ruta, self.rotacion)
+        else:
+            self.rotacion = (self.rotacion + 90) % 360
         self._aplicar_zoom()
 
     def zoom_in(self):
         base = self._zoom_base_actual()
-        self.zoom = min(base * 1.25, 8.0)
+        self.zoom = min(base * 1.15, 8.0)
         self._aplicar_zoom()
         self._notificar_zoom()
 
     def zoom_out(self):
         base = self._zoom_base_actual()
-        self.zoom = max(base / 1.25, 0.1)
+        self.zoom = max(base / 1.15, 0.1)
         self._aplicar_zoom()
         self._notificar_zoom()
 
     def zoom_reset(self):
         self.zoom = None
+        self.ajustar_al_alto = False
+        self._aplicar_zoom()
+        self._notificar_zoom()
+
+    def zoom_ajustar_alto(self):
+        self.zoom = None
+        self.ajustar_al_alto = True
+        self._aplicar_zoom()
+        self._notificar_zoom()
+
+    def zoom_set(self, valor_porcentaje):
+        """Fija el zoom a un valor exacto (en porcentaje, ej: 80 para 80%)."""
+        try:
+            pct = float(valor_porcentaje)
+        except (TypeError, ValueError):
+            return
+        if pct <= 0:
+            return
+        self.zoom = pct / 100.0
+        self.ajustar_al_alto = False
         self._aplicar_zoom()
         self._notificar_zoom()
 
@@ -944,8 +1103,8 @@ class CeldaFoto(QScrollArea):
             return self.zoom
         if not self.pixmaps:
             return 1.0
-        vw = self.viewport().width() - 20
-        vh = self.viewport().height() - 20
+        vw = self.viewport().width() - 36
+        vh = self.viewport().height() - 36
         if vw <= 20 or vh <= 20:
             return 1.0
         _, pm = self.pixmaps[0]
@@ -956,6 +1115,8 @@ class CeldaFoto(QScrollArea):
             )
         if pm_rot.width() == 0 or pm_rot.height() == 0:
             return 1.0
+        if self.ajustar_al_alto:
+            return min(vh / pm_rot.height(), 1.0)
         fw = vw / pm_rot.width()
         fh = vh / pm_rot.height()
         return min(fw, fh, 1.0)
@@ -984,13 +1145,23 @@ class CeldaFoto(QScrollArea):
                     Qt.SmoothTransformation,
                 )
             if self.zoom is None:
-                if pm_rot.width() <= vw and pm_rot.height() <= vh:
+                if self.ajustar_al_alto and pm_rot.height() > 0:
+                    factor = (vh - 30) / pm_rot.height()
+                    factor = min(factor, 1.0)
+                    nuevo_ancho = max(1, int(pm_rot.width() * factor))
+                    nuevo_alto = max(1, int(pm_rot.height() * factor))
+                    pm_final = pm_rot.scaled(
+                        nuevo_ancho, nuevo_alto,
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                elif pm_rot.width() <= vw and pm_rot.height() <= vh:
                     pm_final = pm_rot
                 else:
                     pm_contain = pm_rot.scaled(
-                        vw, vh, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        vw - 20, vh - 20,
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation
                     )
-                    if pm_contain.width() < vw * 0.4:
+                    if pm_contain.width() < (vw - 20) * 0.4:
                         pm_final = pm_rot
                     else:
                         pm_final = pm_contain
@@ -1009,10 +1180,6 @@ class CeldaFoto(QScrollArea):
         self._cont.setMinimumSize(self._cont.sizeHint())
         self._cont.updateGeometry()
 
-
-# =====================================================================
-#  COLUMNA DE IMÁGENES (CARE o CAME) — varias páginas en un solo scroll
-# =====================================================================
 
 class ColumnaImagenes(QWidget):
     def __init__(self, rutas, titulo="", color_titulo="#374151", parent=None):
@@ -1100,10 +1267,8 @@ class ColumnaImagenes(QWidget):
 
         if self.rutas:
             for ruta in self.rutas:
-                # Cargar TODAS las páginas (PDF: todas; imagen: una)
                 pms = _cargar_todas_las_paginas(ruta)
                 if not pms:
-                    # Archivo no previsualizable: mostramos placeholder
                     lbl = QLabel(
                         f"[{os.path.basename(ruta)}]"
                     )
@@ -1151,12 +1316,12 @@ class ColumnaImagenes(QWidget):
 
     def zoom_in(self):
         base = self._zoom_base_actual()
-        self.zoom = min(base * 1.25, 8.0)
+        self.zoom = min(base * 1.15, 8.0)
         self._aplicar_zoom()
 
     def zoom_out(self):
         base = self._zoom_base_actual()
-        self.zoom = max(base / 1.25, 0.1)
+        self.zoom = max(base / 1.15, 0.1)
         self._aplicar_zoom()
 
     def zoom_reset(self):
@@ -1186,6 +1351,8 @@ class ColumnaImagenes(QWidget):
             return
 
         for lbl, pm in self.pixmaps:
+            if pm.isNull():
+                continue
             if self.zoom is None:
                 ancho = min(vw, pm.width())
                 pm_final = pm.scaledToWidth(ancho, Qt.SmoothTransformation)
@@ -1205,29 +1372,30 @@ class ColumnaImagenes(QWidget):
         self.lbl_zoom.setText(f"{pct}%")
 
 
-# =====================================================================
-#  VISTA DE FOTOS
-# =====================================================================
-
 class VistaFotos(QDialog):
     def __init__(self, numero_acta, rutas_care, rutas_came,
                  acta_anterior_fn, acta_siguiente_fn,
-                 modo_inicial="grilla", parent=None):
+                 modo_inicial="grilla", ruta_foco=None, parent=None):
         super().__init__(parent)
         self.setMinimumSize(1000, 720)
         self.setStyleSheet(f"background-color: {BG};")
 
         self.numero_acta_actual = str(numero_acta)
         self.obtener_care_came_fn = None
+        self.obtener_direccion_fn = None
         self.acta_anterior_fn = acta_anterior_fn
         self.acta_siguiente_fn = acta_siguiente_fn
         self.modo = modo_inicial
+        self.ruta_foco = ruta_foco
 
         self.rutas_individual = []
         self.indice_foto_actual = 0
 
         self.rutas_care = list(rutas_care)
         self.rutas_came = list(rutas_came)
+
+        self.zoom_guardado = None
+        self.ajustar_alto_guardado = True
 
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 16, 16, 16)
@@ -1262,12 +1430,31 @@ class VistaFotos(QDialog):
 
         top.addStretch(1)
 
+        self.btn_maps = QPushButton("  Ver en Maps")
+        self.btn_maps.setObjectName("Secondary")
+        self.btn_maps.setIcon(_make_icon("fa5s.map-marked-alt", "#B91C1C"))
+        self.btn_maps.setIconSize(QSize(12, 12))
+        self.btn_maps.setCursor(Qt.PointingHandCursor)
+        self.btn_maps.setToolTip("Abrir la calle y altura del acta en Google Maps")
+        self.btn_maps.clicked.connect(self._abrir_maps)
+        self.btn_maps.setVisible(False)
+        top.addWidget(self.btn_maps)
+
         self.btn_modo = QPushButton()
         self.btn_modo.setObjectName("Secondary")
         self.btn_modo.setIconSize(QSize(12, 12))
         self.btn_modo.setCursor(Qt.PointingHandCursor)
         self.btn_modo.clicked.connect(self._toggle_modo)
         top.addWidget(self.btn_modo)
+
+        self.btn_acta_todo = QPushButton("  Acta + fotos")
+        self.btn_acta_todo.setObjectName("Secondary")
+        self.btn_acta_todo.setIcon(_make_icon("fa5s.columns", "#374151"))
+        self.btn_acta_todo.setIconSize(QSize(12, 12))
+        self.btn_acta_todo.setCursor(Qt.PointingHandCursor)
+        self.btn_acta_todo.setToolTip("Ver el acta PDF junto con CAME y CARE")
+        self.btn_acta_todo.clicked.connect(self._toggle_modo_acta)
+        top.addWidget(self.btn_acta_todo)
 
         self.btn_expandir = QPushButton("  Pantalla completa")
         self.btn_expandir.setObjectName("Secondary")
@@ -1291,6 +1478,7 @@ class VistaFotos(QDialog):
         self.stack.setStyleSheet("background: transparent; border: none;")
         v.addWidget(self.stack, 1)
 
+        # ---------- VISTA 1: GRILLA ----------
         self.vista_split = QWidget()
         vs = QHBoxLayout(self.vista_split)
         vs.setContentsMargins(0, 0, 0, 0)
@@ -1304,6 +1492,7 @@ class VistaFotos(QDialog):
 
         self.stack.addWidget(self.vista_split)
 
+        # ---------- VISTA 2: INDIVIDUAL ----------
         self.vista_individual = QWidget()
         self.vista_individual.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         vi = QHBoxLayout(self.vista_individual)
@@ -1373,12 +1562,10 @@ class VistaFotos(QDialog):
         self.btn_zoom_out.clicked.connect(self._zoom_out)
         acciones.addWidget(self.btn_zoom_out)
 
-        self.lbl_zoom = QLabel("100%")
-        self.lbl_zoom.setAlignment(Qt.AlignCenter)
-        self.lbl_zoom.setFixedWidth(56)
-        self.lbl_zoom.setStyleSheet(
-            f"color: {TEXT_MUTED}; font-size: 9pt; font-weight: 700; "
-            f"background: transparent;"
+        self.lbl_zoom = ZoomSpin(
+            celda_getter=lambda: self._celda_actual(),
+            aplicar_fn=self._actualizar_zoom_individual,
+            ancho=60,
         )
         acciones.addWidget(self.lbl_zoom)
 
@@ -1417,7 +1604,218 @@ class VistaFotos(QDialog):
 
         self.stack.addWidget(self.vista_individual)
 
+        # ---------- VISTA 3: ACTA + CAME + CARE ----------
+        self._build_vista_acta_todo()
+        self.stack.addWidget(self.vista_acta_todo)
+
         self._refrescar()
+
+    def _build_vista_acta_todo(self):
+        self.vista_acta_todo = QWidget()
+        vat = QVBoxLayout(self.vista_acta_todo)
+        vat.setContentsMargins(0, 0, 0, 0)
+        vat.setSpacing(0)
+
+        self.splitter_acta_todo = QSplitter(Qt.Horizontal)
+        self.splitter_acta_todo.setHandleWidth(10)
+        vat.addWidget(self.splitter_acta_todo)
+
+        # -------- Columna 1: ACTA (destacada) --------
+        self.col_acta_frame = QFrame()
+        self.col_acta_frame.setObjectName("ColActaDestacada")
+        self.col_acta_frame.setMinimumWidth(400)
+        self.col_acta_frame.setStyleSheet(f"""
+            QFrame#ColActaDestacada {{
+                background-color: {ACCENT_BG};
+                border: 2px solid {ACCENT};
+                border-radius: 10px;
+            }}
+        """)
+        cla = QVBoxLayout(self.col_acta_frame)
+        cla.setContentsMargins(10, 10, 10, 10)
+        cla.setSpacing(8)
+
+        header_acta = QHBoxLayout()
+        header_acta.setContentsMargins(4, 0, 4, 0)
+        header_acta.setSpacing(8)
+
+        ico_acta = QLabel()
+        ico_acta.setPixmap(_make_icon("fa5s.file-pdf", ACCENT).pixmap(16, 16))
+        ico_acta.setStyleSheet("background: transparent;")
+        header_acta.addWidget(ico_acta)
+
+        lbl_acta = QLabel("ACTA")
+        lbl_acta.setStyleSheet(
+            f"color: {ACCENT}; font-size: 12pt; font-weight: 800; "
+            f"background: transparent; letter-spacing: 1px;"
+        )
+        header_acta.addWidget(lbl_acta)
+
+        self.lbl_acta_todo_num = QLabel("")
+        self.lbl_acta_todo_num.setStyleSheet(
+            f"color: {ACCENT}; font-size: 10pt; font-weight: 600; "
+            f"background: transparent;"
+        )
+        header_acta.addWidget(self.lbl_acta_todo_num)
+
+        header_acta.addStretch(1)
+
+        self.btn_zoom_out_acta_todo = QPushButton()
+        self.btn_zoom_out_acta_todo.setObjectName("Nav")
+        self.btn_zoom_out_acta_todo.setIcon(_make_icon("fa5s.search-minus", "#374151"))
+        self.btn_zoom_out_acta_todo.setIconSize(QSize(11, 11))
+        self.btn_zoom_out_acta_todo.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom_out_acta_todo.setToolTip("Alejar (Ctrl + -)")
+        self.btn_zoom_out_acta_todo.clicked.connect(self._zoom_out_acta_todo)
+        header_acta.addWidget(self.btn_zoom_out_acta_todo)
+
+        self.lbl_zoom_acta_todo = ZoomSpin(
+            celda_getter=lambda: self.acta_visor,
+            aplicar_fn=self._actualizar_zoom_acta_todo,
+            ancho=55,
+        )
+        header_acta.addWidget(self.lbl_zoom_acta_todo)
+
+        self.btn_zoom_in_acta_todo = QPushButton()
+        self.btn_zoom_in_acta_todo.setObjectName("Nav")
+        self.btn_zoom_in_acta_todo.setIcon(_make_icon("fa5s.search-plus", "#374151"))
+        self.btn_zoom_in_acta_todo.setIconSize(QSize(11, 11))
+        self.btn_zoom_in_acta_todo.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom_in_acta_todo.setToolTip("Acercar (Ctrl + +)")
+        self.btn_zoom_in_acta_todo.clicked.connect(self._zoom_in_acta_todo)
+        header_acta.addWidget(self.btn_zoom_in_acta_todo)
+
+        self.btn_ajustar_alto = QPushButton("  Alto")
+        self.btn_ajustar_alto.setObjectName("Secondary")
+        self.btn_ajustar_alto.setIcon(_make_icon("fa5s.arrows-alt-v", "#374151"))
+        self.btn_ajustar_alto.setIconSize(QSize(11, 11))
+        self.btn_ajustar_alto.setCursor(Qt.PointingHandCursor)
+        self.btn_ajustar_alto.setToolTip("Ajustar la imagen a la altura del visor")
+        self.btn_ajustar_alto.clicked.connect(self._ajustar_alto_acta_todo)
+        header_acta.addWidget(self.btn_ajustar_alto)
+
+        self.btn_ajustar_ancho = QPushButton("  Ajustar")
+        self.btn_ajustar_ancho.setObjectName("Secondary")
+        self.btn_ajustar_ancho.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
+        self.btn_ajustar_ancho.setIconSize(QSize(11, 11))
+        self.btn_ajustar_ancho.setCursor(Qt.PointingHandCursor)
+        self.btn_ajustar_ancho.setToolTip("Ajustar la imagen al ancho del visor (Ctrl + 0)")
+        self.btn_ajustar_ancho.clicked.connect(self._zoom_reset_acta_todo)
+        header_acta.addWidget(self.btn_ajustar_ancho)
+
+        cla.addLayout(header_acta)
+
+        self.acta_visor = CeldaFoto(QPixmap(), ajustar_al_alto=True)
+        self.acta_visor.setStyleSheet(
+            f"QScrollArea {{ background-color: {CARD}; "
+            f"border: 1px solid {BORDER}; border-radius: 8px; }}"
+        )
+        cla.addWidget(self.acta_visor, 1)
+
+        self.splitter_acta_todo.addWidget(self.col_acta_frame)
+
+        frame_came = self._build_columna_foto(
+            titulo="CAME", color="#B45309", icono="fa5s.camera"
+        )
+        flc = frame_came.layout()
+        self.col_came_todo = ColumnaImagenes([], titulo="", color_titulo="#B45309")
+        self.col_came_todo.lbl_titulo.setVisible(False)
+        self.col_came_todo.btn_zoom_out.setVisible(False)
+        self.col_came_todo.lbl_zoom.setVisible(False)
+        self.col_came_todo.btn_zoom_in.setVisible(False)
+        self.col_came_todo.btn_zoom_reset.setVisible(False)
+        flc.addWidget(self.col_came_todo, 1)
+        self.splitter_acta_todo.addWidget(frame_came)
+
+        frame_care = self._build_columna_foto(
+            titulo="CARE", color=ACCENT, icono="fa5s.camera"
+        )
+        flr = frame_care.layout()
+        self.col_care_todo = ColumnaImagenes([], titulo="", color_titulo=ACCENT)
+        self.col_care_todo.lbl_titulo.setVisible(False)
+        self.col_care_todo.btn_zoom_out.setVisible(False)
+        self.col_care_todo.lbl_zoom.setVisible(False)
+        self.col_care_todo.btn_zoom_in.setVisible(False)
+        self.col_care_todo.btn_zoom_reset.setVisible(False)
+        flr.addWidget(self.col_care_todo, 1)
+        self.splitter_acta_todo.addWidget(frame_care)
+
+        self.splitter_acta_todo.setSizes([600, 350, 350])
+        self.splitter_acta_todo.setStretchFactor(0, 5)
+        self.splitter_acta_todo.setStretchFactor(1, 3)
+        self.splitter_acta_todo.setStretchFactor(2, 3)
+
+        self.splitter_acta_todo.setCollapsible(0, False)
+        self.splitter_acta_todo.setCollapsible(1, False)
+        self.splitter_acta_todo.setCollapsible(2, False)
+
+    def _build_columna_foto(self, titulo, color, icono="fa5s.camera"):
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {CARD};
+                border: 1px solid {BORDER};
+                border-radius: 10px;
+            }}
+        """)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 0, 4, 0)
+        header.setSpacing(8)
+
+        ico = QLabel()
+        ico.setPixmap(_make_icon(icono, color).pixmap(15, 15))
+        ico.setStyleSheet("background: transparent;")
+        header.addWidget(ico)
+
+        lbl = QLabel(titulo)
+        lbl.setStyleSheet(
+            f"color: {color}; font-size: 12pt; font-weight: 800; "
+            f"background: transparent; letter-spacing: 1px;"
+        )
+        header.addWidget(lbl)
+
+        header.addStretch(1)
+
+        layout.addLayout(header)
+
+        return frame
+
+    def _zoom_in_acta_todo(self):
+        self.acta_visor.zoom_in()
+        self._actualizar_zoom_acta_todo()
+
+    def _zoom_out_acta_todo(self):
+        self.acta_visor.zoom_out()
+        self._actualizar_zoom_acta_todo()
+
+    def _zoom_reset_acta_todo(self):
+        self.acta_visor.zoom_reset()
+        self._actualizar_zoom_acta_todo()
+
+    def _ajustar_alto_acta_todo(self):
+        self.acta_visor.zoom_ajustar_alto()
+        self._actualizar_zoom_acta_todo()
+
+    def _actualizar_zoom_acta_todo(self):
+        try:
+            self.lbl_zoom_acta_todo.actualizar_texto()
+        except Exception:
+            pass
+
+    def _actualizar_zoom_individual(self):
+        try:
+            self.lbl_zoom.actualizar_texto()
+        except Exception:
+            pass
+
+    def _guardar_zoom_actual(self):
+        if self.acta_visor is not None and self.acta_visor.pixmaps:
+            self.zoom_guardado = self.acta_visor.zoom
+            self.ajustar_alto_guardado = self.acta_visor.ajustar_al_alto
 
     def _contenedor_columna(self, titulo, tipo):
         frame = QFrame()
@@ -1447,18 +1845,65 @@ class VistaFotos(QDialog):
     def set_obtener_care_came_fn(self, fn):
         self.obtener_care_came_fn = fn
 
+    def set_obtener_direccion_fn(self, fn):
+        self.obtener_direccion_fn = fn
+        self._actualizar_boton_maps()
+
+    def _actualizar_boton_maps(self):
+        calle, altura = (None, None)
+        if self.obtener_direccion_fn is not None:
+            try:
+                calle, altura = self.obtener_direccion_fn(self.numero_acta_actual)
+            except Exception:
+                calle, altura = (None, None)
+
+        if calle:
+            self.btn_maps.setVisible(True)
+            txt = str(calle)
+            if altura:
+                txt = f"{txt} {altura}"
+            self.btn_maps.setToolTip(f"Ver en Google Maps: {txt}, CABA")
+        else:
+            self.btn_maps.setVisible(False)
+
+    def _abrir_maps(self):
+        calle, altura = (None, None)
+        if self.obtener_direccion_fn is not None:
+            try:
+                calle, altura = self.obtener_direccion_fn(self.numero_acta_actual)
+            except Exception:
+                calle, altura = (None, None)
+
+        if not calle:
+            QMessageBox.information(
+                self, "Sin dirección",
+                "No se pudo determinar la calle ni la altura para esta acta."
+            )
+            return
+
+        ok = _abrir_en_maps(calle, altura)
+        if not ok:
+            QMessageBox.warning(
+                self, "No se pudo abrir Maps",
+                "No se pudo abrir el navegador con Google Maps."
+            )
+
     def _ir_acta_anterior(self):
         ant = self.acta_anterior_fn(self.numero_acta_actual)
         if ant is not None:
+            self._guardar_zoom_actual()
             self.numero_acta_actual = str(ant)
             self.indice_foto_actual = 0
+            self.ruta_foco = None
             self._refrescar()
 
     def _ir_acta_siguiente(self):
         sig = self.acta_siguiente_fn(self.numero_acta_actual)
         if sig is not None:
+            self._guardar_zoom_actual()
             self.numero_acta_actual = str(sig)
             self.indice_foto_actual = 0
+            self.ruta_foco = None
             self._refrescar()
 
     def _ir_foto_anterior(self):
@@ -1472,21 +1917,33 @@ class VistaFotos(QDialog):
             self._cargar_individual()
 
     def _toggle_modo(self):
-        if self.modo == "grilla":
+        if self.modo == "individual":
+            self.modo = "grilla"
+        else:
             self.modo = "individual"
             self.rutas_individual = list(self.rutas_came) + list(self.rutas_care)
             self.indice_foto_actual = 0
-        else:
+        self._refrescar()
+
+    def _toggle_modo_acta(self):
+        if self.modo == "acta_todo":
             self.modo = "grilla"
+            self.btn_acta_todo.setText("  Acta + fotos")
+        else:
+            self.modo = "acta_todo"
+            self.btn_acta_todo.setText("  Ocultar acta")
         self._refrescar()
 
     def _actualizar_boton_modo(self):
         if self.modo == "grilla":
             self.btn_modo.setText("  Ver una por una")
             self.btn_modo.setIcon(_make_icon("fa5s.image", "#374151"))
-        else:
+        elif self.modo == "individual":
             self.btn_modo.setText("  Ver todas juntas")
             self.btn_modo.setIcon(_make_icon("fa5s.th", "#374151"))
+        else:
+            self.btn_modo.setText("  Ver una por una")
+            self.btn_modo.setIcon(_make_icon("fa5s.image", "#374151"))
 
     def _refrescar(self):
         if self.obtener_care_came_fn is not None:
@@ -1498,11 +1955,16 @@ class VistaFotos(QDialog):
                 pass
 
         self._actualizar_boton_modo()
+        self._actualizar_boton_maps()
 
         self._titulo_lbl.setText(
             f"ACTA {self.numero_acta_actual}  ·  "
             f"CAME: {len(self.rutas_came)}  ·  CARE: {len(self.rutas_care)}"
         )
+        try:
+            self.lbl_acta_todo_num.setText(f"· N° {self.numero_acta_actual}")
+        except Exception:
+            pass
 
         self.btn_acta_prev.setEnabled(
             self.acta_anterior_fn(self.numero_acta_actual) is not None
@@ -1514,13 +1976,16 @@ class VistaFotos(QDialog):
         if self.modo == "grilla":
             self.stack.setCurrentWidget(self.vista_split)
             self._recargar_columnas()
-        else:
+        elif self.modo == "individual":
             self.stack.setCurrentWidget(self.vista_individual)
             if not self.rutas_individual:
                 self.rutas_individual = list(self.rutas_came) + list(self.rutas_care)
             if self.indice_foto_actual >= len(self.rutas_individual):
                 self.indice_foto_actual = 0
             self._cargar_individual()
+        elif self.modo == "acta_todo":
+            self.stack.setCurrentWidget(self.vista_acta_todo)
+            self._cargar_modo_acta_todo()
 
     def _recargar_columnas(self):
         layout_split = self.vista_split.layout()
@@ -1582,6 +2047,82 @@ class VistaFotos(QDialog):
 
         QTimer.singleShot(0, col._aplicar_zoom)
 
+    def _cargar_modo_acta_todo(self):
+        while self.acta_visor._vbox.count():
+            item = self.acta_visor._vbox.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.acta_visor.pixmaps = []
+
+        if self.zoom_guardado is not None:
+            self.acta_visor.zoom = self.zoom_guardado
+            self.acta_visor.ajustar_al_alto = False
+        else:
+            self.acta_visor.zoom = None
+            self.acta_visor.ajustar_al_alto = self.ajustar_alto_guardado
+
+        ruta_pdf = None
+        num_pagina = 1
+
+        parent = self.parent()
+        if parent is None:
+            parent = self.window()
+
+        if parent is not None and hasattr(parent, "indice_pdfs") and parent.indice_pdfs is not None:
+            numero = self.numero_acta_actual
+            if numero in parent.indice_pdfs["por_nro"]:
+                id_norm = parent.indice_pdfs["por_nro"][numero]
+                entry = parent.indice_pdfs["por_id"].get(id_norm)
+                if entry:
+                    ruta_pdf = entry.get("ruta")
+                    datos = entry.get("datos") or {}
+                    num_pagina = datos.get("pagina", 1)
+
+        if ruta_pdf and os.path.exists(ruta_pdf) and PYMUPDF_OK:
+            pm = self._renderizar_pagina_pdf_local(ruta_pdf, num_pagina)
+            if pm is not None:
+                self.acta_visor._agregar_pagina(pm)
+                QTimer.singleShot(80, self.acta_visor._aplicar_zoom)
+            else:
+                self.acta_visor._agregar_mensaje(
+                    "⚠ No se pudo renderizar la página del PDF."
+                )
+        else:
+            self.acta_visor._agregar_mensaje(
+                "⚠ No se encontró el PDF del acta."
+            )
+
+        self._actualizar_zoom_acta_todo()
+
+        self._set_rutas_columna(self.col_came_todo, self.rutas_came)
+        self._set_rutas_columna(self.col_care_todo, self.rutas_care)
+
+    def _renderizar_pagina_pdf_local(self, ruta_pdf, num_pagina):
+        if not PYMUPDF_OK:
+            return None
+        try:
+            doc = fitz.open(ruta_pdf)
+            idx = max(0, int(num_pagina) - 1)
+            if idx >= doc.page_count:
+                doc.close()
+                return None
+            pagina = doc.load_page(idx)
+            mat = fitz.Matrix(2.0, 2.0)
+            pix = pagina.get_pixmap(matrix=mat, alpha=False)
+            img = QImage(
+                pix.samples,
+                pix.width,
+                pix.height,
+                pix.stride,
+                QImage.Format_RGB888,
+            )
+            pm = QPixmap.fromImage(img.copy())
+            doc.close()
+            return pm
+        except Exception:
+            return None
+
     def _limpiar_img_container(self):
         while self.img_container.count() > 0:
             w = self.img_container.widget(0)
@@ -1606,6 +2147,10 @@ class VistaFotos(QDialog):
             self.btn_abrir_ind.setEnabled(False)
             return
 
+        if self.ruta_foco is not None and self.ruta_foco in self.rutas_individual:
+            self.indice_foto_actual = self.rutas_individual.index(self.ruta_foco)
+            self.ruta_foco = None
+
         if self.indice_foto_actual >= len(self.rutas_individual):
             self.indice_foto_actual = 0
 
@@ -1617,9 +2162,7 @@ class VistaFotos(QDialog):
         self.img_container.addWidget(celda)
         self.img_container.setCurrentWidget(celda)
 
-        QTimer.singleShot(0, lambda: self.lbl_zoom.setText(
-            f"{celda.porcentaje_actual()}%"
-        ))
+        QTimer.singleShot(0, self._actualizar_zoom_individual)
 
         self.btn_foto_prev.setEnabled(self.indice_foto_actual > 0)
         self.btn_foto_next.setEnabled(
@@ -1665,21 +2208,25 @@ class VistaFotos(QDialog):
         c = self._celda_actual()
         if c is not None:
             c.zoom_in()
+            self._actualizar_zoom_individual()
 
     def _zoom_out(self):
         c = self._celda_actual()
         if c is not None:
             c.zoom_out()
+            self._actualizar_zoom_individual()
 
     def _zoom_reset(self):
         c = self._celda_actual()
         if c is not None:
             c.zoom_reset()
+            self._actualizar_zoom_individual()
 
     def _actualizar_indicador_zoom(self, celda):
-        if celda is not self._celda_actual():
-            return
-        self.lbl_zoom.setText(f"{celda.porcentaje_actual()}%")
+        if celda is self._celda_actual():
+            self._actualizar_zoom_individual()
+        elif celda is self.acta_visor:
+            self._actualizar_zoom_acta_todo()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -1766,7 +2313,7 @@ class ThumbnailFoto(QFrame):
         lbl_img.setStyleSheet("background: transparent; border: none;")
 
         pm = _cargar_pixmap(ruta_archivo)
-        if pm is not None:
+        if pm is not None and not pm.isNull():
             pm = pm.scaled(
                 tamanio[0] - 30, tamanio[1] - 60,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation
@@ -1809,7 +2356,7 @@ class ThumbnailFoto(QFrame):
             return
         if event.button() == Qt.LeftButton:
             parent = self.window()
-            if hasattr(parent, "_abrir_vista_foto"):
+            if hasattr(parent, "_abrir_vista_foto_en_indice"):
                 nro = None
                 for n, datos in parent.indice_fotos.items():
                     todas = list(datos.get("care", [])) + list(datos.get("came", []))
@@ -1817,7 +2364,9 @@ class ThumbnailFoto(QFrame):
                         nro = n
                         break
                 if nro is not None:
-                    parent._abrir_vista_foto(nro, modo="grilla")
+                    parent._abrir_vista_foto_en_indice(
+                        nro, modo="individual", ruta_foco=self.ruta_archivo
+                    )
                     return
 
 
@@ -1838,10 +2387,11 @@ def _calcular_columnas(cantidad):
 
 
 class GaleriaFotos(QWidget):
-    def __init__(self, rutas_archivos, parent=None):
+    def __init__(self, rutas_archivos, parent=None, direccion_fn=None):
         super().__init__(parent)
         self.rutas = rutas_archivos
         self.seleccionadas = set()
+        self.direccion_fn = direccion_fn
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -1861,6 +2411,16 @@ class GaleriaFotos(QWidget):
         self.btn_toggle_todas.clicked.connect(self._toggle_todas)
         bt.addWidget(self.btn_toggle_todas)
 
+        self.btn_maps = QPushButton("  Ver en Maps")
+        self.btn_maps.setObjectName("Secondary")
+        self.btn_maps.setIcon(_make_icon("fa5s.map-marked-alt", "#B91C1C"))
+        self.btn_maps.setIconSize(QSize(12, 12))
+        self.btn_maps.setCursor(Qt.PointingHandCursor)
+        self.btn_maps.setToolTip("Abrir la calle y altura del acta en Google Maps")
+        self.btn_maps.clicked.connect(self._abrir_maps)
+        self.btn_maps.setVisible(False)
+        bt.addWidget(self.btn_maps)
+
         bt.addStretch(1)
 
         self.btn_ver_sel = QPushButton("  Ver seleccionadas (0)")
@@ -1873,6 +2433,8 @@ class GaleriaFotos(QWidget):
         bt.addWidget(self.btn_ver_sel)
 
         v.addWidget(self.barra_top)
+
+        self._actualizar_boton_maps()
 
         n = len(rutas_archivos)
         cols = _calcular_columnas(n)
@@ -1904,6 +2466,45 @@ class GaleriaFotos(QWidget):
             grid.setAlignment(Qt.AlignHCenter)
 
         v.addWidget(self.grid_widget)
+
+    def _actualizar_boton_maps(self):
+        calle, altura = (None, None)
+        if self.direccion_fn is not None:
+            try:
+                calle, altura = self.direccion_fn()
+            except Exception:
+                calle, altura = (None, None)
+
+        if calle:
+            self.btn_maps.setVisible(True)
+            txt = str(calle)
+            if altura:
+                txt = f"{txt} {altura}"
+            self.btn_maps.setToolTip(f"Ver en Google Maps: {txt}, CABA")
+        else:
+            self.btn_maps.setVisible(False)
+
+    def _abrir_maps(self):
+        calle, altura = (None, None)
+        if self.direccion_fn is not None:
+            try:
+                calle, altura = self.direccion_fn()
+            except Exception:
+                calle, altura = (None, None)
+
+        if not calle:
+            QMessageBox.information(
+                self, "Sin dirección",
+                "No se pudo determinar la calle ni la altura para esta acta."
+            )
+            return
+
+        ok = _abrir_en_maps(calle, altura)
+        if not ok:
+            QMessageBox.warning(
+                self, "No se pudo abrir Maps",
+                "No se pudo abrir el navegador con Google Maps."
+            )
 
     def _on_toggle(self, ruta, checked):
         if checked:
@@ -1943,14 +2544,21 @@ class GaleriaFotos(QWidget):
             return
         parent = self.window()
         nro = None
+        primera = None
         if hasattr(parent, "indice_fotos"):
             for n, datos in parent.indice_fotos.items():
                 todas = list(datos.get("care", [])) + list(datos.get("came", []))
-                if any(r in todas for r in self.seleccionadas):
-                    nro = n
+                for r in todas:
+                    if r in self.seleccionadas:
+                        nro = n
+                        primera = r
+                        break
+                if nro is not None:
                     break
-        if nro is not None:
-            parent._abrir_vista_foto(nro, modo="grilla")
+        if nro is not None and hasattr(parent, "_abrir_vista_foto_en_indice"):
+            parent._abrir_vista_foto_en_indice(
+                nro, modo="individual", ruta_foco=primera
+            )
 
 
 class DialogoErrores(QDialog):
@@ -2287,6 +2895,10 @@ class ComparadorWindow(QMainWindow):
 
         self.modo_tabla = "acta"
 
+        self.celda_acta = None
+        self.zoom_acta_guardado = None
+        self.ajustar_alto_acta_guardado = False
+
         self._build_ui()
         self._actualizar_botones()
         self._actualizar_lista_actas()
@@ -2299,14 +2911,36 @@ class ComparadorWindow(QMainWindow):
             return [], []
         return datos.get("care", []), datos.get("came", [])
 
-    def _abrir_vista_foto(self, numero_acta, modo="grilla"):
+    def _direccion_de_acta(self, numero_acta):
+        r = self.resultados_por_acta.get(str(numero_acta))
+        return _calle_altura_de_resultado(r)
+
+    def _direccion_de_acta_actual(self):
+        if not self.actas:
+            return (None, None)
+        numero = self.actas[self.idx_actual]
+        return self._direccion_de_acta(numero)
+
+    def _abrir_vista_foto(self, numero_acta, modo="grilla", ruta_foco=None):
         care, came = self._care_came_de_acta(numero_acta)
         dlg = VistaFotos(
             numero_acta, care, came,
             self._acta_anterior, self._acta_siguiente,
-            modo_inicial=modo, parent=self,
+            modo_inicial=modo, ruta_foco=ruta_foco, parent=self,
         )
         dlg.set_obtener_care_came_fn(self._care_came_de_acta)
+        dlg.set_obtener_direccion_fn(self._direccion_de_acta)
+        dlg.exec_()
+
+    def _abrir_vista_foto_en_indice(self, numero_acta, modo="individual", ruta_foco=None):
+        care, came = self._care_came_de_acta(numero_acta)
+        dlg = VistaFotos(
+            numero_acta, care, came,
+            self._acta_anterior, self._acta_siguiente,
+            modo_inicial=modo, ruta_foco=ruta_foco, parent=self,
+        )
+        dlg.set_obtener_care_came_fn(self._care_came_de_acta)
+        dlg.set_obtener_direccion_fn(self._direccion_de_acta)
         dlg.exec_()
 
     def _acta_anterior(self, numero_acta):
@@ -2330,6 +2964,11 @@ class ComparadorWindow(QMainWindow):
         except Exception:
             pass
         return None
+
+    def _guardar_zoom_acta(self):
+        if self.celda_acta is not None and self.celda_acta.pixmaps:
+            self.zoom_acta_guardado = self.celda_acta.zoom
+            self.ajustar_alto_acta_guardado = self.celda_acta.ajustar_al_alto
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2401,14 +3040,6 @@ class ComparadorWindow(QMainWindow):
         self.btn_limpiar.clicked.connect(self.limpiar_todo)
         hl.addWidget(self.btn_limpiar)
 
-        self.btn_reporte = QPushButton("  Exportar reporte")
-        self.btn_reporte.setObjectName("Primary")
-        self.btn_reporte.setIcon(_make_icon("fa5s.file-download", "#FFFFFF"))
-        self.btn_reporte.setIconSize(QSize(14, 14))
-        self.btn_reporte.setCursor(Qt.PointingHandCursor)
-        self.btn_reporte.clicked.connect(self.exportar_reporte)
-        hl.addWidget(self.btn_reporte)
-
         root.addWidget(header)
 
         nav = QFrame()
@@ -2435,11 +3066,12 @@ class ComparadorWindow(QMainWindow):
         cw.setContentsMargins(20, 20, 20, 16)
         cw.setSpacing(0)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(18)
+        self.splitter_principal = QSplitter(Qt.Horizontal)
+        self.splitter_principal.setHandleWidth(18)
 
         sidebar = QFrame()
         sidebar.setObjectName("Card")
+        sidebar.setMinimumWidth(180)
         sv = QVBoxLayout(sidebar)
         sv.setContentsMargins(14, 16, 14, 14)
         sv.setSpacing(12)
@@ -2529,10 +3161,11 @@ class ComparadorWindow(QMainWindow):
         self.lista_actas.itemClicked.connect(self._click_lista)
         sv.addWidget(self.lista_actas, 1)
 
-        splitter.addWidget(sidebar)
+        self.splitter_principal.addWidget(sidebar)
 
         panel_excel = QFrame()
         panel_excel.setObjectName("Card")
+        panel_excel.setMinimumWidth(180)
         vexc = QVBoxLayout(panel_excel)
         vexc.setContentsMargins(20, 18, 20, 20)
         vexc.setSpacing(12)
@@ -2546,6 +3179,14 @@ class ComparadorWindow(QMainWindow):
 
         fila_titulo.addStretch(1)
 
+        self.btn_modo_central = QPushButton("  Ver imagen del acta")
+        self.btn_modo_central.setObjectName("Secondary")
+        self.btn_modo_central.setIcon(_make_icon("fa5s.image", "#374151"))
+        self.btn_modo_central.setIconSize(QSize(12, 12))
+        self.btn_modo_central.setCursor(Qt.PointingHandCursor)
+        self.btn_modo_central.clicked.connect(self._toggle_modo_central)
+        fila_titulo.addWidget(self.btn_modo_central)
+
         self.btn_toggle_tabla = QPushButton("  Ver todas las filas")
         self.btn_toggle_tabla.setObjectName("Secondary")
         self.btn_toggle_tabla.setIcon(_make_icon("fa5s.list", "#374151"))
@@ -2556,13 +3197,106 @@ class ComparadorWindow(QMainWindow):
 
         vexc.addLayout(fila_titulo)
 
-        self.tabla = TablaFiltrable()
-        vexc.addWidget(self.tabla, 1)
+        self.stack_central = QStackedWidget()
 
-        splitter.addWidget(panel_excel)
+        self.tabla = TablaFiltrable()
+        self.stack_central.addWidget(self.tabla)
+
+        self.visor_acta = QWidget()
+        vl = QVBoxLayout(self.visor_acta)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(8)
+
+        barra_visor = QHBoxLayout()
+        barra_visor.setContentsMargins(0, 0, 0, 0)
+        barra_visor.setSpacing(8)
+
+        self.btn_acta_prev = QPushButton()
+        self.btn_acta_prev.setObjectName("Nav")
+        self.btn_acta_prev.setIcon(_make_icon("fa5s.chevron-left", "#374151"))
+        self.btn_acta_prev.setIconSize(QSize(12, 12))
+        self.btn_acta_prev.setCursor(Qt.PointingHandCursor)
+        self.btn_acta_prev.setToolTip("Acta anterior")
+        self.btn_acta_prev.clicked.connect(self.ir_anterior)
+        barra_visor.addWidget(self.btn_acta_prev)
+
+        self.lbl_acta_visor = QLabel("—")
+        self.lbl_acta_visor.setStyleSheet(
+            f"color: {TEXT}; font-size: 11pt; font-weight: 700;"
+        )
+        barra_visor.addWidget(self.lbl_acta_visor)
+
+        self.btn_acta_next = QPushButton()
+        self.btn_acta_next.setObjectName("Nav")
+        self.btn_acta_next.setIcon(_make_icon("fa5s.chevron-right", "#374151"))
+        self.btn_acta_next.setIconSize(QSize(12, 12))
+        self.btn_acta_next.setCursor(Qt.PointingHandCursor)
+        self.btn_acta_next.setToolTip("Acta siguiente")
+        self.btn_acta_next.clicked.connect(self.ir_siguiente)
+        barra_visor.addWidget(self.btn_acta_next)
+
+        barra_visor.addStretch(1)
+
+        self.btn_zoom_out_acta = QPushButton()
+        self.btn_zoom_out_acta.setObjectName("Nav")
+        self.btn_zoom_out_acta.setIcon(_make_icon("fa5s.search-minus", "#374151"))
+        self.btn_zoom_out_acta.setIconSize(QSize(12, 12))
+        self.btn_zoom_out_acta.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom_out_acta.setToolTip("Alejar (Ctrl + -)")
+        self.btn_zoom_out_acta.clicked.connect(self._zoom_out_acta)
+        barra_visor.addWidget(self.btn_zoom_out_acta)
+
+        self.lbl_zoom_acta = ZoomSpin(
+            celda_getter=lambda: self.celda_acta,
+            aplicar_fn=self._actualizar_zoom_acta,
+            ancho=60,
+        )
+        barra_visor.addWidget(self.lbl_zoom_acta)
+
+        self.btn_zoom_in_acta = QPushButton()
+        self.btn_zoom_in_acta.setObjectName("Nav")
+        self.btn_zoom_in_acta.setIcon(_make_icon("fa5s.search-plus", "#374151"))
+        self.btn_zoom_in_acta.setIconSize(QSize(12, 12))
+        self.btn_zoom_in_acta.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom_in_acta.setToolTip("Acercar (Ctrl + +)")
+        self.btn_zoom_in_acta.clicked.connect(self._zoom_in_acta)
+        barra_visor.addWidget(self.btn_zoom_in_acta)
+
+        self.btn_zoom_reset_acta = QPushButton("  Ajustar")
+        self.btn_zoom_reset_acta.setObjectName("Secondary")
+        self.btn_zoom_reset_acta.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
+        self.btn_zoom_reset_acta.setIconSize(QSize(12, 12))
+        self.btn_zoom_reset_acta.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom_reset_acta.setToolTip("Ajustar a ventana")
+        self.btn_zoom_reset_acta.clicked.connect(self._zoom_reset_acta)
+        barra_visor.addWidget(self.btn_zoom_reset_acta)
+
+        self.btn_abrir_pdf_sys = QPushButton("  Abrir PDF con sistema")
+        self.btn_abrir_pdf_sys.setObjectName("Secondary")
+        self.btn_abrir_pdf_sys.setIcon(_make_icon("fa5s.external-link-alt", "#374151"))
+        self.btn_abrir_pdf_sys.setIconSize(QSize(12, 12))
+        self.btn_abrir_pdf_sys.setCursor(Qt.PointingHandCursor)
+        self.btn_abrir_pdf_sys.clicked.connect(self._abrir_pdf_sistema)
+        barra_visor.addWidget(self.btn_abrir_pdf_sys)
+
+        vl.addLayout(barra_visor)
+
+        self.celda_acta = CeldaFoto(QPixmap())
+        self.celda_acta.setStyleSheet(
+            f"QScrollArea {{ background-color: {CARD_2}; "
+            f"border: 1px solid {BORDER}; border-radius: 8px; }}"
+        )
+        vl.addWidget(self.celda_acta, 1)
+
+        self.stack_central.addWidget(self.visor_acta)
+
+        vexc.addWidget(self.stack_central, 1)
+
+        self.splitter_principal.addWidget(panel_excel)
 
         panel_der = QFrame()
         panel_der.setObjectName("Card")
+        panel_der.setMinimumWidth(200)
         vder = QVBoxLayout(panel_der)
         vder.setContentsMargins(0, 0, 0, 0)
         vder.setSpacing(0)
@@ -2581,14 +3315,18 @@ class ComparadorWindow(QMainWindow):
         scroll.setWidget(cont)
         vder.addWidget(scroll)
 
-        splitter.addWidget(panel_der)
+        self.splitter_principal.addWidget(panel_der)
 
-        splitter.setSizes([300, 660, 740])
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 4)
-        splitter.setStretchFactor(2, 5)
+        self.splitter_principal.setSizes([300, 660, 740])
+        self.splitter_principal.setStretchFactor(0, 0)
+        self.splitter_principal.setStretchFactor(1, 4)
+        self.splitter_principal.setStretchFactor(2, 5)
 
-        cw.addWidget(splitter, 1)
+        self.splitter_principal.setCollapsible(0, False)
+        self.splitter_principal.setCollapsible(1, False)
+        self.splitter_principal.setCollapsible(2, False)
+
+        cw.addWidget(self.splitter_principal, 1)
         root.addWidget(content_wrap, 1)
 
         self.status = self.statusBar()
@@ -2596,7 +3334,171 @@ class ComparadorWindow(QMainWindow):
 
         self.setStyleSheet(QSS)
 
+    def _toggle_modo_central(self):
+        if self.modo_tabla == "imagen":
+            self._guardar_zoom_acta()
+            self.modo_tabla = "acta"
+            self.btn_modo_central.setText("  Ver imagen del acta")
+            self.btn_modo_central.setIcon(_make_icon("fa5s.image", "#374151"))
+            self.lbl_titulo_tabla.setText("PLANILLA SAP · FILAS DEL ACTA")
+            self.btn_toggle_tabla.setVisible(True)
+            self.stack_central.setCurrentWidget(self.tabla)
+            self._cargar_tabla_excel()
+        else:
+            self.modo_tabla = "imagen"
+            self.btn_modo_central.setText("  Info del acta")
+            self.btn_modo_central.setIcon(_make_icon("fa5s.info-circle", "#374151"))
+            self.lbl_titulo_tabla.setText("ACTA COMPLETA · PDF")
+            self.btn_toggle_tabla.setVisible(False)
+            self.stack_central.setCurrentWidget(self.visor_acta)
+            self._cargar_imagen_acta()
+
+    def _cargar_imagen_acta(self):
+        if not self.actas:
+            self.lbl_acta_visor.setText("—")
+            return
+
+        numero = self.actas[self.idx_actual]
+        self.lbl_acta_visor.setText(f"ACTA N° {numero}")
+
+        self.btn_acta_prev.setEnabled(self.idx_actual > 0)
+        self.btn_acta_next.setEnabled(self.idx_actual < len(self.actas) - 1)
+
+        ruta_pdf = None
+        num_pagina = 1
+
+        if self.indice_pdfs is not None and numero in self.indice_pdfs["por_nro"]:
+            id_norm = self.indice_pdfs["por_nro"][numero]
+            entry = self.indice_pdfs["por_id"].get(id_norm)
+            if entry:
+                ruta_pdf = entry.get("ruta")
+                datos = entry.get("datos") or {}
+                num_pagina = datos.get("pagina", 1)
+
+        layout = self.visor_acta.layout()
+        if self.celda_acta is not None:
+            layout.removeWidget(self.celda_acta)
+            self.celda_acta.deleteLater()
+            self.celda_acta = None
+
+        self.celda_acta = CeldaFoto(QPixmap())
+        self.celda_acta.setStyleSheet(
+            f"QScrollArea {{ background-color: {CARD_2}; "
+            f"border: 1px solid {BORDER}; border-radius: 8px; }}"
+        )
+        layout.addWidget(self.celda_acta, 1)
+
+        if self.zoom_acta_guardado is not None:
+            self.celda_acta.zoom = self.zoom_acta_guardado
+            self.celda_acta.ajustar_al_alto = False
+        else:
+            self.celda_acta.zoom = None
+            self.celda_acta.ajustar_al_alto = self.ajustar_alto_acta_guardado
+
+        self.lbl_zoom_acta.actualizar_texto()
+
+        if not ruta_pdf or not os.path.exists(ruta_pdf):
+            self.celda_acta._agregar_mensaje(
+                "⚠ No se encontró el PDF de esta acta.\n\n"
+                "Cargá la carpeta de PDFs con 'Abrir carpeta PDFs'."
+            )
+            return
+
+        pm = self._renderizar_pagina_pdf(ruta_pdf, num_pagina)
+        if pm is None:
+            if PYMUPDF_OK:
+                self.celda_acta._agregar_mensaje(
+                    f"⚠ No se pudo renderizar la página {num_pagina} del PDF."
+                )
+            else:
+                self.celda_acta._agregar_mensaje(
+                    "Para previsualizar PDFs, instalá pymupdf:\n\npip install pymupdf"
+                )
+            return
+
+        self.celda_acta._agregar_pagina(pm)
+
+        QTimer.singleShot(80, self._ajustar_zoom_acta)
+
+    def _renderizar_pagina_pdf(self, ruta_pdf, num_pagina):
+        if not PYMUPDF_OK:
+            return None
+        try:
+            doc = fitz.open(ruta_pdf)
+            idx = max(0, int(num_pagina) - 1)
+            if idx >= doc.page_count:
+                doc.close()
+                return None
+            pagina = doc.load_page(idx)
+            mat = fitz.Matrix(1.5, 1.5)
+            pix = pagina.get_pixmap(matrix=mat, alpha=False)
+            img = QImage(
+                pix.samples,
+                pix.width,
+                pix.height,
+                pix.stride,
+                QImage.Format_RGB888,
+            )
+            pm = QPixmap.fromImage(img.copy())
+            doc.close()
+            return pm
+        except Exception:
+            return None
+
+    def _ajustar_zoom_acta(self):
+        if self.celda_acta is None:
+            return
+        self.celda_acta._aplicar_zoom()
+        self._actualizar_zoom_acta()
+
+    def _actualizar_zoom_acta(self):
+        if self.celda_acta is None:
+            return
+        try:
+            self.lbl_zoom_acta.actualizar_texto()
+        except Exception:
+            pass
+
+    def _actualizar_indicador_zoom(self, celda):
+        if celda is self.celda_acta:
+            try:
+                self.lbl_zoom_acta.actualizar_texto()
+            except Exception:
+                pass
+
+    def _zoom_in_acta(self):
+        if self.celda_acta is not None:
+            self.celda_acta.zoom_in()
+            self._actualizar_zoom_acta()
+
+    def _zoom_out_acta(self):
+        if self.celda_acta is not None:
+            self.celda_acta.zoom_out()
+            self._actualizar_zoom_acta()
+
+    def _zoom_reset_acta(self):
+        if self.celda_acta is not None:
+            self.celda_acta.zoom_reset()
+            self._actualizar_zoom_acta()
+
+    def _abrir_pdf_sistema(self):
+        if not self.actas:
+            return
+        numero = self.actas[self.idx_actual]
+        ruta_pdf = None
+        if self.indice_pdfs is not None and numero in self.indice_pdfs["por_nro"]:
+            id_norm = self.indice_pdfs["por_nro"][numero]
+            entry = self.indice_pdfs["por_id"].get(id_norm)
+            if entry:
+                ruta_pdf = entry.get("ruta")
+        if not ruta_pdf:
+            QMessageBox.information(self, "Sin PDF", "No se encontró el PDF de esta acta.")
+            return
+        _abrir_con_sistema(ruta_pdf)
+
     def _toggle_vista_tabla(self):
+        if self.modo_tabla == "imagen":
+            return
         if self.modo_tabla == "acta":
             self.modo_tabla = "todo"
             self.btn_toggle_tabla.setText("  Ver solo esta acta")
@@ -2632,13 +3534,11 @@ class ComparadorWindow(QMainWindow):
                     subtitulo=f"{i + 1}/{len(subcarpetas)} · {sub}",
                 )
 
-                # Ignoramos la carpeta _cache como si fuera un acta
                 if sub == "_cache":
                     continue
 
                 ruta_sub = os.path.join(carpeta, sub)
 
-                # 1) Regenerar _cache a partir de los HTML que haya
                 for nombre in sorted(os.listdir(ruta_sub)):
                     ruta_arch = os.path.join(ruta_sub, nombre)
                     if not os.path.isfile(ruta_arch):
@@ -2647,9 +3547,6 @@ class ComparadorWindow(QMainWindow):
                     if ext in EXT_HTML:
                         _extraer_imagenes_de_html(ruta_arch)
 
-                # 2) Juntar TODOS los archivos analizables:
-                #    - directos en la subcarpeta (PDF, imágenes, etc.)
-                #    - los de la subcarpeta _cache/
                 candidatos = []
 
                 for nombre in sorted(os.listdir(ruta_sub)):
@@ -2668,7 +3565,6 @@ class ComparadorWindow(QMainWindow):
                         if _es_archivo_analizable(ruta_arch):
                             candidatos.append(ruta_arch)
 
-                # 3) Clasificar por nombre (care / came)
                 care = []
                 came = []
                 for r in candidatos:
@@ -2895,6 +3791,31 @@ class ComparadorWindow(QMainWindow):
         self.tabla.cargar_datos([], [])
         self._limpiar_panel_derecho()
         self._filtro_numeros = None
+        self.zoom_acta_guardado = None
+        self.ajustar_alto_acta_guardado = False
+
+        self.modo_tabla = "acta"
+        self.btn_modo_central.setText("  Ver imagen del acta")
+        self.btn_modo_central.setIcon(_make_icon("fa5s.image", "#374151"))
+        self.btn_toggle_tabla.setVisible(True)
+        self.btn_toggle_tabla.setText("  Ver todas las filas")
+        self.btn_toggle_tabla.setIcon(_make_icon("fa5s.list", "#374151"))
+        self.lbl_titulo_tabla.setText("PLANILLA SAP · FILAS DEL ACTA")
+        self.stack_central.setCurrentWidget(self.tabla)
+
+        layout = self.visor_acta.layout()
+        if self.celda_acta is not None:
+            layout.removeWidget(self.celda_acta)
+            self.celda_acta.deleteLater()
+            self.celda_acta = None
+        self.celda_acta = CeldaFoto(QPixmap())
+        self.celda_acta.setStyleSheet(
+            f"QScrollArea {{ background-color: {CARD_2}; "
+            f"border: 1px solid {BORDER}; border-radius: 8px; }}"
+        )
+        layout.addWidget(self.celda_acta, 1)
+        self.lbl_acta_visor.setText("—")
+        self.lbl_zoom_acta.actualizar_texto()
 
         self.lbl_nav.setText("Sin datos cargados")
         self.lbl_estado.setText("")
@@ -3008,11 +3929,15 @@ class ComparadorWindow(QMainWindow):
             self.resultados_por_acta[numero] = resultado
 
     def ir_anterior(self):
+        if self.modo_tabla == "imagen":
+            self._guardar_zoom_acta()
         if self.idx_actual > 0:
             self.idx_actual -= 1
             self._mostrar_actual()
 
     def ir_siguiente(self):
+        if self.modo_tabla == "imagen":
+            self._guardar_zoom_acta()
         if self.idx_actual < len(self.actas) - 1:
             self.idx_actual += 1
             self._mostrar_actual()
@@ -3020,6 +3945,8 @@ class ComparadorWindow(QMainWindow):
     def _click_lista(self, item):
         idx = item.data(Qt.UserRole)
         if idx is not None and idx != self.idx_actual:
+            if self.modo_tabla == "imagen":
+                self._guardar_zoom_acta()
             self.idx_actual = idx
             self._mostrar_actual()
 
@@ -3030,6 +3957,8 @@ class ComparadorWindow(QMainWindow):
         self.btn_limpiar.setEnabled(
             self.df is not None or self.indice_pdfs is not None or bool(self.indice_fotos)
         )
+        self.btn_acta_prev.setEnabled(tiene_actas and self.idx_actual > 0)
+        self.btn_acta_next.setEnabled(tiene_actas and self.idx_actual < len(self.actas) - 1)
 
     def _acta_pasa_filtro(self, numero):
         if self._filtro_numeros is None:
@@ -3162,59 +4091,7 @@ class ComparadorWindow(QMainWindow):
             if w:
                 w.deleteLater()
 
-    def _mostrar_actual(self):
-        if not self.actas:
-            self.lbl_nav.setText("Sin datos cargados")
-            self.lbl_estado.setText("")
-            self._limpiar_panel_derecho()
-            self.tabla.cargar_datos([], [])
-            return
-
-        if not self._acta_pasa_filtro(self.actas[self.idx_actual]):
-            for i, a in enumerate(self.actas):
-                if self._acta_pasa_filtro(a):
-                    self.idx_actual = i
-                    break
-
-        numero = self.actas[self.idx_actual]
-        r = self.resultados_por_acta.get(numero)
-        tipo = r["tipo"] if r else "desconocido"
-
-        tipo_txt = {
-            "excel": "SAP",
-            "pdf": "PDF",
-            "ambos": "SAP + PDF",
-        }.get(tipo, tipo)
-
-        self.lbl_nav.setText(
-            f"Acta {self.idx_actual + 1} de {len(self.actas)}  ·  Acta N° {numero}"
-        )
-        self.lbl_estado.setText(f"Origen: {tipo_txt}")
-
-        self._cargar_tabla_excel()
-        self._limpiar_panel_derecho()
-
-        if tipo == "pdf":
-            if r and r["datos_pdf"]:
-                self._bloque_pdf(r["datos_pdf"])
-            else:
-                self._aviso("PDF NO ENCONTRADO", "No se pudo leer el PDF de esta acta.")
-        elif tipo == "excel":
-            if r and r["df_acta"] is not None and not r["df_acta"].empty:
-                fila0 = r["df_acta"].iloc[0]
-                self._bloque_sap(r["df_acta"], fila0, r)
-            else:
-                self._aviso("SIN DATOS", "No hay filas del SAP para esta acta.")
-        elif tipo == "ambos":
-            fila0 = r["df_acta"].iloc[0]
-            self._bloque_sap(r["df_acta"], fila0, r)
-            self._bloque_pdf(r["datos_pdf"])
-            self._bloque_comparacion(r["df_acta"], fila0, r["datos_pdf"], r)
-        else:
-            self._aviso("SIN DATOS", "No se encontraron datos para esta acta.")
-
-        self._bloque_fotos(numero)
-
+    def _actualizar_label_estado(self, r, tipo, tipo_txt):
         if tipo == "ambos" and r and r["encontrado"]:
             ok_items = r["filas_ok"] == r["filas_total"]
             ok_calle = r.get("ok_calle", False)
@@ -3245,6 +4122,72 @@ class ComparadorWindow(QMainWindow):
             self.lbl_estado.setStyleSheet(
                 f"color: {TEXT_MUTED}; font-weight: 700; font-size: 9.5pt;"
             )
+
+    def _poblar_panel_derecho(self, r, tipo, tipo_txt, numero):
+        if tipo == "pdf":
+            if r and r["datos_pdf"]:
+                self._bloque_pdf(r["datos_pdf"])
+            else:
+                self._aviso("PDF NO ENCONTRADO", "No se pudo leer el PDF de esta acta.")
+        elif tipo == "excel":
+            if r and r["df_acta"] is not None and not r["df_acta"].empty:
+                fila0 = r["df_acta"].iloc[0]
+                self._bloque_sap(r["df_acta"], fila0, r)
+            else:
+                self._aviso("SIN DATOS", "No hay filas del SAP para esta acta.")
+        elif tipo == "ambos":
+            fila0 = r["df_acta"].iloc[0]
+            self._bloque_sap(r["df_acta"], fila0, r)
+            self._bloque_pdf(r["datos_pdf"])
+            self._bloque_comparacion(r["df_acta"], fila0, r["datos_pdf"], r)
+        else:
+            self._aviso("SIN DATOS", "No se encontraron datos para esta acta.")
+
+        self._bloque_fotos(numero)
+
+    def _mostrar_actual(self):
+        if not self.actas:
+            self.lbl_nav.setText("Sin datos cargados")
+            self.lbl_estado.setText("")
+            self._limpiar_panel_derecho()
+            self.tabla.cargar_datos([], [])
+            return
+
+        if not self._acta_pasa_filtro(self.actas[self.idx_actual]):
+            for i, a in enumerate(self.actas):
+                if self._acta_pasa_filtro(a):
+                    self.idx_actual = i
+                    break
+
+        numero = self.actas[self.idx_actual]
+        r = self.resultados_por_acta.get(numero)
+        tipo = r["tipo"] if r else "desconocido"
+
+        tipo_txt = {
+            "excel": "SAP",
+            "pdf": "PDF",
+            "ambos": "SAP + PDF",
+        }.get(tipo, tipo)
+
+        self.lbl_nav.setText(
+            f"Acta {self.idx_actual + 1} de {len(self.actas)}  ·  Acta N° {numero}"
+        )
+        self.lbl_estado.setText(f"Origen: {tipo_txt}")
+
+        if self.modo_tabla == "imagen":
+            self._cargar_imagen_acta()
+            self._limpiar_panel_derecho()
+            self._poblar_panel_derecho(r, tipo, tipo_txt, numero)
+            self._actualizar_label_estado(r, tipo, tipo_txt)
+            self.vcont.addStretch(1)
+            self._actualizar_botones()
+            self._seleccionar_en_lista(self.idx_actual)
+            return
+
+        self._cargar_tabla_excel()
+        self._limpiar_panel_derecho()
+        self._poblar_panel_derecho(r, tipo, tipo_txt, numero)
+        self._actualizar_label_estado(r, tipo, tipo_txt)
 
         self.vcont.addStretch(1)
         self._actualizar_botones()
@@ -3322,7 +4265,8 @@ class ComparadorWindow(QMainWindow):
 
         todas = list(came) + list(care)
         if todas:
-            galeria = GaleriaFotos(todas)
+            direccion_fn = (lambda n=numero_acta: self._direccion_de_acta(n))
+            galeria = GaleriaFotos(todas, direccion_fn=direccion_fn)
             v.addWidget(galeria)
         else:
             lbl = QLabel("No se encontraron documentos para esta acta.")
@@ -3524,34 +4468,6 @@ class ComparadorWindow(QMainWindow):
 
         self.vcont.addWidget(card)
 
-    def exportar_reporte(self):
-        if not self.resultados_por_acta:
-            QMessageBox.warning(self, "Sin datos", "Todavía no hay resultados para exportar.")
-            return
-        ruta, _ = QFileDialog.getSaveFileName(
-            self, "Guardar reporte", "reporte_comparacion.xlsx", "Excel (*.xlsx)"
-        )
-        if not ruta:
-            return
-
-        lista = list(self.resultados_por_acta.values())
-
-        datos_reporte = []
-        for r in lista:
-            datos_reporte.append({
-                "acta_id": r["acta_numero"],
-                "encontrado": r["encontrado"],
-                "filas_ok": r["filas_ok"],
-                "filas_total": r["filas_total"],
-                "por_operacion": r.get("por_operacion", []),
-            })
-
-        try:
-            generar_reporte(datos_reporte, ruta)
-            QMessageBox.information(self, "Listo", f"Reporte guardado en:\n{ruta}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"No se pudo guardar:\n{e}")
-
 
 QSS = f"""
 * {{
@@ -3663,23 +4579,6 @@ QPushButton#Danger:disabled {{
     background-color: transparent;
 }}
 
-QPushButton#Primary {{
-    background-color: {ACCENT};
-    color: #FFFFFF;
-    border: 1px solid {ACCENT};
-    padding: 9px 18px;
-    font-weight: 600;
-}}
-QPushButton#Primary:hover {{
-    background-color: {ACCENT_H};
-    border-color: {ACCENT_H};
-}}
-QPushButton#Primary:disabled {{
-    background-color: #BFDBFE;
-    border-color: #BFDBFE;
-    color: #FFFFFF;
-}}
-
 QPushButton#Nav {{
     background-color: {CARD};
     border: 1px solid {BORDER_2};
@@ -3767,7 +4666,11 @@ QSplitter::handle {{
     background-color: transparent;
 }}
 QSplitter::handle:horizontal {{
-    width: 18px;
+    width: 12px;
+}}
+QSplitter::handle:hover {{
+    background-color: {ACCENT};
+    border-radius: 6px;
 }}
 
 QScrollBar:vertical {{
