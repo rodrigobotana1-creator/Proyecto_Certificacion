@@ -422,17 +422,6 @@ def _contar_bloques_en_pixmap(
     min_filas_contenido=100,
     ignorar_bordes_pct=0.03,
 ):
-    """Cuenta cuántos 'bloques' de contenido (fotos) hay en un QPixmap.
-
-    Parámetros calibrados para:
-    - Detectar fotos separadas por espacios blancos finos (~10px).
-    - Ignorar bloques de texto (títulos, leyendas) que ocupan pocas filas.
-    - Ignorar posibles encabezados/pies de página muy cerca de los bordes.
-
-    Regla clave: solo se considera 'foto' un bloque que tenga
-    al menos `min_filas_contenido` filas de contenido. El texto, por
-    más que sea grande, ocupa pocas filas verticales y queda descartado.
-    """
     if pm is None or pm.isNull():
         return 0
 
@@ -442,7 +431,6 @@ def _contar_bloques_en_pixmap(
     if ancho <= 0 or alto <= 0:
         return 0
 
-    # Ignorar franjas de borde (encabezado/pie)
     margen = int(alto * ignorar_bordes_pct)
     y_ini = margen
     y_fin = alto - margen
@@ -450,7 +438,6 @@ def _contar_bloques_en_pixmap(
         y_ini = 0
         y_fin = alto
 
-    # Para cada fila, ver si tiene contenido
     filas_con_contenido = []
     for y in range(y_ini, y_fin):
         tiene_contenido = False
@@ -464,7 +451,6 @@ def _contar_bloques_en_pixmap(
                 break
         filas_con_contenido.append(tiene_contenido)
 
-    # Detectar bloques
     bloques = []
     en_bloque = False
     inicio_bloque = 0
@@ -486,7 +472,6 @@ def _contar_bloques_en_pixmap(
     if en_bloque:
         bloques.append((inicio_bloque, len(filas_con_contenido) - 1))
 
-    # Filtrar bloques muy chicos (probablemente texto, no fotos)
     bloques_filtrados = []
     for (ini, fin) in bloques:
         alto_bloque = fin - ini + 1
@@ -497,12 +482,6 @@ def _contar_bloques_en_pixmap(
 
 
 def _contar_paginas_totales(rutas, detectar_bloques=False):
-    """Cuenta la cantidad total de páginas/imágenes que van a mostrarse.
-
-    Si detectar_bloques=True, para cada página de PDF se analiza el
-    contenido y se cuentan los 'bloques' separados por espacio blanco.
-    Si es False, se cuenta cada página como 1.
-    """
     total = 0
     for ruta in rutas:
         ext = os.path.splitext(ruta)[1].lower()
@@ -516,7 +495,6 @@ def _contar_paginas_totales(rutas, detectar_bloques=False):
                         total += 1
                     else:
                         pagina = doc.load_page(i)
-                        # Resolución baja para análisis rápido
                         mat = fitz.Matrix(1.0, 1.0)
                         pix = pagina.get_pixmap(matrix=mat, alpha=False)
                         img = QImage(
@@ -998,8 +976,6 @@ class TablaFiltrable(QWidget):
 
 
 class ZoomSpin(QLineEdit):
-    """Campo de texto que muestra y permite escribir el % exacto de zoom."""
-
     def __init__(self, celda_getter, aplicar_fn, ancho=60, parent=None):
         super().__init__(parent)
         self.celda_getter = celda_getter
@@ -1516,6 +1492,8 @@ class VistaFotos(QDialog):
         self.zoom_guardado = None
         self.ajustar_alto_guardado = True
 
+        self._buscando = False
+
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 16, 16, 16)
         v.setSpacing(12)
@@ -1525,6 +1503,8 @@ class VistaFotos(QDialog):
 
         self.btn_acta_prev = QPushButton()
         self.btn_acta_prev.setObjectName("Nav")
+        self.btn_acta_prev.setAutoDefault(False)
+        self.btn_acta_prev.setDefault(False)
         self.btn_acta_prev.setIcon(_make_icon("fa5s.angle-double-left", "#374151"))
         self.btn_acta_prev.setIconSize(QSize(14, 14))
         self.btn_acta_prev.setCursor(Qt.PointingHandCursor)
@@ -1540,6 +1520,8 @@ class VistaFotos(QDialog):
 
         self.btn_acta_next = QPushButton()
         self.btn_acta_next.setObjectName("Nav")
+        self.btn_acta_next.setAutoDefault(False)
+        self.btn_acta_next.setDefault(False)
         self.btn_acta_next.setIcon(_make_icon("fa5s.angle-double-right", "#374151"))
         self.btn_acta_next.setIconSize(QSize(14, 14))
         self.btn_acta_next.setCursor(Qt.PointingHandCursor)
@@ -1547,10 +1529,48 @@ class VistaFotos(QDialog):
         self.btn_acta_next.clicked.connect(self._ir_acta_siguiente)
         top.addWidget(self.btn_acta_next)
 
+        # --- Buscador de actas ---
+        top.addSpacing(12)
+        self.input_buscar_acta = QLineEdit()
+        self.input_buscar_acta.setPlaceholderText("Ingresar acta")
+        self.input_buscar_acta.setFixedWidth(130)
+        self.input_buscar_acta.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {CARD};
+                color: {TEXT};
+                border: 1px solid {BORDER_2};
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 9.5pt;
+                font-weight: 600;
+            }}
+            QLineEdit:focus {{
+                border-color: {ACCENT};
+                background-color: {ACCENT_BG};
+            }}
+        """)
+        self.input_buscar_acta.setToolTip("Escribí el número de acta y presioná Enter")
+        self.input_buscar_acta.returnPressed.connect(self._ir_a_acta_buscada)
+        top.addWidget(self.input_buscar_acta)
+
+        self.btn_ir_a_acta = QPushButton("  Ir")
+        self.btn_ir_a_acta.setObjectName("Secondary")
+        self.btn_ir_a_acta.setAutoDefault(False)
+        self.btn_ir_a_acta.setDefault(False)
+        self.btn_ir_a_acta.setIcon(_make_icon("fa5s.arrow-right", "#374151"))
+        self.btn_ir_a_acta.setIconSize(QSize(11, 11))
+        self.btn_ir_a_acta.setCursor(Qt.PointingHandCursor)
+        self.btn_ir_a_acta.setToolTip("Ir al acta ingresada")
+        self.btn_ir_a_acta.clicked.connect(self._ir_a_acta_buscada)
+        top.addWidget(self.btn_ir_a_acta)
+        # --- FIN buscador ---
+
         top.addStretch(1)
 
         self.btn_maps = QPushButton("  Ver en Maps")
         self.btn_maps.setObjectName("Secondary")
+        self.btn_maps.setAutoDefault(False)
+        self.btn_maps.setDefault(False)
         self.btn_maps.setIcon(_make_icon("fa5s.map-marked-alt", "#B91C1C"))
         self.btn_maps.setIconSize(QSize(12, 12))
         self.btn_maps.setCursor(Qt.PointingHandCursor)
@@ -1561,6 +1581,8 @@ class VistaFotos(QDialog):
 
         self.btn_modo = QPushButton()
         self.btn_modo.setObjectName("Secondary")
+        self.btn_modo.setAutoDefault(False)
+        self.btn_modo.setDefault(False)
         self.btn_modo.setIconSize(QSize(12, 12))
         self.btn_modo.setCursor(Qt.PointingHandCursor)
         self.btn_modo.clicked.connect(self._toggle_modo)
@@ -1568,6 +1590,8 @@ class VistaFotos(QDialog):
 
         self.btn_acta_todo = QPushButton("  Acta + fotos")
         self.btn_acta_todo.setObjectName("Secondary")
+        self.btn_acta_todo.setAutoDefault(False)
+        self.btn_acta_todo.setDefault(False)
         self.btn_acta_todo.setIcon(_make_icon("fa5s.columns", "#374151"))
         self.btn_acta_todo.setIconSize(QSize(12, 12))
         self.btn_acta_todo.setCursor(Qt.PointingHandCursor)
@@ -1577,6 +1601,8 @@ class VistaFotos(QDialog):
 
         self.btn_expandir = QPushButton("  Pantalla completa")
         self.btn_expandir.setObjectName("Secondary")
+        self.btn_expandir.setAutoDefault(False)
+        self.btn_expandir.setDefault(False)
         self.btn_expandir.setIcon(_make_icon("fa5s.expand", "#374151"))
         self.btn_expandir.setIconSize(QSize(12, 12))
         self.btn_expandir.setCursor(Qt.PointingHandCursor)
@@ -1585,6 +1611,8 @@ class VistaFotos(QDialog):
 
         btn_cerrar = QPushButton("  Cerrar")
         btn_cerrar.setObjectName("Secondary")
+        btn_cerrar.setAutoDefault(False)
+        btn_cerrar.setDefault(False)
         btn_cerrar.setIcon(_make_icon("fa5s.times", "#374151"))
         btn_cerrar.setIconSize(QSize(12, 12))
         btn_cerrar.setCursor(Qt.PointingHandCursor)
@@ -1620,6 +1648,8 @@ class VistaFotos(QDialog):
 
         self.btn_foto_prev = QPushButton()
         self.btn_foto_prev.setObjectName("NavGrande")
+        self.btn_foto_prev.setAutoDefault(False)
+        self.btn_foto_prev.setDefault(False)
         self.btn_foto_prev.setIcon(_make_icon("fa5s.chevron-left", "#374151"))
         self.btn_foto_prev.setIconSize(QSize(24, 24))
         self.btn_foto_prev.setCursor(Qt.PointingHandCursor)
@@ -1656,6 +1686,8 @@ class VistaFotos(QDialog):
 
         self.btn_rotar_ind = QPushButton("  Rotar")
         self.btn_rotar_ind.setObjectName("Secondary")
+        self.btn_rotar_ind.setAutoDefault(False)
+        self.btn_rotar_ind.setDefault(False)
         self.btn_rotar_ind.setIcon(_make_icon("fa5s.sync-alt", "#374151"))
         self.btn_rotar_ind.setIconSize(QSize(12, 12))
         self.btn_rotar_ind.setCursor(Qt.PointingHandCursor)
@@ -1664,6 +1696,8 @@ class VistaFotos(QDialog):
 
         self.btn_abrir_ind = QPushButton("  Abrir con sistema")
         self.btn_abrir_ind.setObjectName("Secondary")
+        self.btn_abrir_ind.setAutoDefault(False)
+        self.btn_abrir_ind.setDefault(False)
         self.btn_abrir_ind.setIcon(_make_icon("fa5s.external-link-alt", "#374151"))
         self.btn_abrir_ind.setIconSize(QSize(12, 12))
         self.btn_abrir_ind.setCursor(Qt.PointingHandCursor)
@@ -1674,6 +1708,8 @@ class VistaFotos(QDialog):
 
         self.btn_zoom_out = QPushButton()
         self.btn_zoom_out.setObjectName("Nav")
+        self.btn_zoom_out.setAutoDefault(False)
+        self.btn_zoom_out.setDefault(False)
         self.btn_zoom_out.setIcon(_make_icon("fa5s.search-minus", "#374151"))
         self.btn_zoom_out.setIconSize(QSize(12, 12))
         self.btn_zoom_out.setCursor(Qt.PointingHandCursor)
@@ -1690,6 +1726,8 @@ class VistaFotos(QDialog):
 
         self.btn_zoom_in = QPushButton()
         self.btn_zoom_in.setObjectName("Nav")
+        self.btn_zoom_in.setAutoDefault(False)
+        self.btn_zoom_in.setDefault(False)
         self.btn_zoom_in.setIcon(_make_icon("fa5s.search-plus", "#374151"))
         self.btn_zoom_in.setIconSize(QSize(12, 12))
         self.btn_zoom_in.setCursor(Qt.PointingHandCursor)
@@ -1699,6 +1737,8 @@ class VistaFotos(QDialog):
 
         self.btn_zoom_reset = QPushButton("  Ajustar")
         self.btn_zoom_reset.setObjectName("Secondary")
+        self.btn_zoom_reset.setAutoDefault(False)
+        self.btn_zoom_reset.setDefault(False)
         self.btn_zoom_reset.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
         self.btn_zoom_reset.setIconSize(QSize(12, 12))
         self.btn_zoom_reset.setCursor(Qt.PointingHandCursor)
@@ -1713,6 +1753,8 @@ class VistaFotos(QDialog):
 
         self.btn_foto_next = QPushButton()
         self.btn_foto_next.setObjectName("NavGrande")
+        self.btn_foto_next.setAutoDefault(False)
+        self.btn_foto_next.setDefault(False)
         self.btn_foto_next.setIcon(_make_icon("fa5s.chevron-right", "#374151"))
         self.btn_foto_next.setIconSize(QSize(24, 24))
         self.btn_foto_next.setCursor(Qt.PointingHandCursor)
@@ -1739,7 +1781,7 @@ class VistaFotos(QDialog):
         self.splitter_acta_todo.setHandleWidth(10)
         vat.addWidget(self.splitter_acta_todo)
 
-        # -------- Columna 1: ACTA (gris, sin azul) --------
+        # -------- Columna 1: ACTA --------
         self.col_acta_frame = QFrame()
         self.col_acta_frame.setObjectName("ColActaDestacada")
         self.col_acta_frame.setMinimumWidth(400)
@@ -1781,6 +1823,8 @@ class VistaFotos(QDialog):
 
         self.btn_zoom_out_acta_todo = QPushButton()
         self.btn_zoom_out_acta_todo.setObjectName("Nav")
+        self.btn_zoom_out_acta_todo.setAutoDefault(False)
+        self.btn_zoom_out_acta_todo.setDefault(False)
         self.btn_zoom_out_acta_todo.setIcon(_make_icon("fa5s.search-minus", "#374151"))
         self.btn_zoom_out_acta_todo.setIconSize(QSize(11, 11))
         self.btn_zoom_out_acta_todo.setCursor(Qt.PointingHandCursor)
@@ -1797,6 +1841,8 @@ class VistaFotos(QDialog):
 
         self.btn_zoom_in_acta_todo = QPushButton()
         self.btn_zoom_in_acta_todo.setObjectName("Nav")
+        self.btn_zoom_in_acta_todo.setAutoDefault(False)
+        self.btn_zoom_in_acta_todo.setDefault(False)
         self.btn_zoom_in_acta_todo.setIcon(_make_icon("fa5s.search-plus", "#374151"))
         self.btn_zoom_in_acta_todo.setIconSize(QSize(11, 11))
         self.btn_zoom_in_acta_todo.setCursor(Qt.PointingHandCursor)
@@ -1806,6 +1852,8 @@ class VistaFotos(QDialog):
 
         self.btn_ajustar_alto = QPushButton("  Alto")
         self.btn_ajustar_alto.setObjectName("Secondary")
+        self.btn_ajustar_alto.setAutoDefault(False)
+        self.btn_ajustar_alto.setDefault(False)
         self.btn_ajustar_alto.setIcon(_make_icon("fa5s.arrows-alt-v", "#374151"))
         self.btn_ajustar_alto.setIconSize(QSize(11, 11))
         self.btn_ajustar_alto.setCursor(Qt.PointingHandCursor)
@@ -1815,6 +1863,8 @@ class VistaFotos(QDialog):
 
         self.btn_ajustar_ancho = QPushButton("  Ajustar")
         self.btn_ajustar_ancho.setObjectName("Secondary")
+        self.btn_ajustar_ancho.setAutoDefault(False)
+        self.btn_ajustar_ancho.setDefault(False)
         self.btn_ajustar_ancho.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
         self.btn_ajustar_ancho.setIconSize(QSize(11, 11))
         self.btn_ajustar_ancho.setCursor(Qt.PointingHandCursor)
@@ -1833,14 +1883,14 @@ class VistaFotos(QDialog):
 
         self.splitter_acta_todo.addWidget(self.col_acta_frame)
 
-        # -------- Columna 2: CAME (con zoom) --------
+        # -------- Columna 2: CAME --------
         frame_came = self._build_columna_foto_con_zoom(
             titulo="CAME", color="#B45309", icono="fa5s.camera"
         )
         self.col_came_todo = frame_came.col_imagenes
         self.splitter_acta_todo.addWidget(frame_came)
 
-        # -------- Columna 3: CARE (con zoom) --------
+        # -------- Columna 3: CARE --------
         frame_care = self._build_columna_foto_con_zoom(
             titulo="CARE", color=ACCENT, icono="fa5s.camera"
         )
@@ -1896,6 +1946,8 @@ class VistaFotos(QDialog):
 
         btn_zoom_out = QPushButton()
         btn_zoom_out.setObjectName("Nav")
+        btn_zoom_out.setAutoDefault(False)
+        btn_zoom_out.setDefault(False)
         btn_zoom_out.setIcon(_make_icon("fa5s.search-minus", "#374151"))
         btn_zoom_out.setIconSize(QSize(11, 11))
         btn_zoom_out.setCursor(Qt.PointingHandCursor)
@@ -1913,6 +1965,8 @@ class VistaFotos(QDialog):
 
         btn_zoom_in = QPushButton()
         btn_zoom_in.setObjectName("Nav")
+        btn_zoom_in.setAutoDefault(False)
+        btn_zoom_in.setDefault(False)
         btn_zoom_in.setIcon(_make_icon("fa5s.search-plus", "#374151"))
         btn_zoom_in.setIconSize(QSize(11, 11))
         btn_zoom_in.setCursor(Qt.PointingHandCursor)
@@ -1921,6 +1975,8 @@ class VistaFotos(QDialog):
 
         btn_zoom_reset = QPushButton("  Ajustar")
         btn_zoom_reset.setObjectName("Secondary")
+        btn_zoom_reset.setAutoDefault(False)
+        btn_zoom_reset.setDefault(False)
         btn_zoom_reset.setIcon(_make_icon("fa5s.expand-arrows-alt", "#374151"))
         btn_zoom_reset.setIconSize(QSize(11, 11))
         btn_zoom_reset.setCursor(Qt.PointingHandCursor)
@@ -2062,6 +2118,7 @@ class VistaFotos(QDialog):
             self.numero_acta_actual = str(ant)
             self.indice_foto_actual = 0
             self.ruta_foco = None
+            self.rutas_individual = []
             self._refrescar()
 
     def _ir_acta_siguiente(self):
@@ -2071,7 +2128,47 @@ class VistaFotos(QDialog):
             self.numero_acta_actual = str(sig)
             self.indice_foto_actual = 0
             self.ruta_foco = None
+            self.rutas_individual = []
             self._refrescar()
+
+    # --- Lógica del buscador ---
+    def _ir_a_acta_buscada(self):
+        if self._buscando:
+            return
+        self._buscando = True
+        try:
+            texto = self.input_buscar_acta.text().strip()
+            if not texto:
+                return
+
+            parent = self.parent()
+            if parent is None:
+                parent = self.window()
+
+            if not hasattr(parent, "actas") or not parent.actas:
+                QMessageBox.information(
+                    self, "Sin datos",
+                    "No hay actas cargadas en la lista principal."
+                )
+                return
+
+            if texto in parent.actas:
+                self._guardar_zoom_actual()
+                self.numero_acta_actual = texto
+                self.indice_foto_actual = 0
+                self.ruta_foco = None
+                self.rutas_individual = []
+                self._refrescar()
+                self.input_buscar_acta.clear()
+                self.input_buscar_acta.clearFocus()
+            else:
+                QMessageBox.information(
+                    self, "Acta no encontrada",
+                    f"El acta N° {texto} no se encuentra en la lista de actas cargadas."
+                )
+                self.input_buscar_acta.selectAll()
+        finally:
+            self._buscando = False
 
     def _ir_foto_anterior(self):
         if self.indice_foto_actual > 0:
@@ -2124,8 +2221,6 @@ class VistaFotos(QDialog):
         self._actualizar_boton_modo()
         self._actualizar_boton_maps()
 
-        # CAME: detecta bloques dentro de cada página (para contar imágenes separadas)
-        # CARE: cuenta páginas/archivos normales
         cant_came = _contar_paginas_totales(self.rutas_came, detectar_bloques=True)
         cant_care = _contar_paginas_totales(self.rutas_care, detectar_bloques=False)
 
@@ -2150,8 +2245,7 @@ class VistaFotos(QDialog):
             self._recargar_columnas()
         elif self.modo == "individual":
             self.stack.setCurrentWidget(self.vista_individual)
-            if not self.rutas_individual:
-                self.rutas_individual = list(self.rutas_came) + list(self.rutas_care)
+            self.rutas_individual = list(self.rutas_came) + list(self.rutas_care)
             if self.indice_foto_actual >= len(self.rutas_individual):
                 self.indice_foto_actual = 0
             self._cargar_individual()
