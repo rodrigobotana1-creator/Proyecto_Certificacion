@@ -104,19 +104,13 @@ def _contar_letras(txt):
 
 
 def _es_palabra_vacia(txt):
-    return txt.strip().upper() in _PALABRAS_VACIAS
+    # DESACTIVADO: queremos guardar la calle tal cual el PDF
+    return False
 
 
 def _es_titulo_tabla(txt):
-    return bool(re.search(
-        r"\b(Empresa|Obra|Fecha|CAME|CARE|ACTA|Zona|Renglón|Renglon|"
-        r"Cierre|Servicios|Publicos|Públicos|Bacheo|Profundo|"
-        r"Levantamiento|Recolocacion|Recolocación|Pavimento|Arena|"
-        r"Asfalto|Hormigon|Hormigón|Sellado|Juntas|Fisuras|Reductor|"
-        r"Velocidad|Adoquin|Adoquín|Material|Colocacion|Colocación|"
-        r"Provision|Provisión|Ejecucion|Ejecución|Medicion|Medición)\b",
-        txt, re.IGNORECASE
-    ))
+    # DESACTIVADO: queremos guardar la calle tal cual el PDF
+    return False
 
 
 def _agrupar_por_top(items, tolerancia=20):
@@ -276,7 +270,6 @@ def _formar_combinaciones_alturas(alturas):
             b_izq = fila_abajo[0]["valor"]
             b_der = fila_abajo[-1]["valor"]
             pares = []
-            # Solo las dos combinaciones correctas: cada fila por separado
             for a, b in [(a_izq, a_der), (b_izq, b_der)]:
                 ini, fin = sorted([a, b])
                 pares.append({"ini": ini, "fin": fin})
@@ -295,17 +288,22 @@ def _limpiar_texto_bloque(texto):
 def _es_texto_valido_calle(texto):
     if not texto:
         return False
+    # Solo descartamos el bloque entero si es puramente numérico (alturas)
     if _es_solo_numeros(texto):
         return False
-    if _es_palabra_vacia(texto):
-        return False
-    if ":" in texto:
-        return False
-    if _es_titulo_tabla(texto):
-        return False
-    if _contar_letras(texto) < 3:
-        return False
     return True
+
+
+def _normalizar_calle_para_guardar(texto):
+    """
+    Devuelve la calle SIN las palabras vacías.
+    Se usa para comparar contra el Excel.
+    """
+    if not texto:
+        return ""
+    palabras = texto.split()
+    limpias = [p for p in palabras if p.upper() not in _PALABRAS_VACIAS]
+    return " ".join(limpias)
 
 
 def _extraer_calle(pagina, palabras, alturas, top_tabla):
@@ -358,16 +356,11 @@ def _extraer_calle(pagina, palabras, alturas, top_tabla):
         candidatos.sort(key=lambda c: abs((c["x0"] + c["x1"]) / 2 - x_centro))
         return candidatos[0]["texto"]
 
+    # Fallback: usar palabras individuales tal cual, sin filtrar nada
     palabras_cand = []
     for p in palabras:
         txt = p["text"].strip()
         if not txt:
-            continue
-        if _es_solo_numeros(txt):
-            continue
-        if _es_palabra_vacia(txt):
-            continue
-        if ":" in txt:
             continue
         if p["top"] >= top_tabla:
             continue
@@ -429,10 +422,6 @@ def _es_item(txt):
 
 
 def _detectar_tabla_y_items(tabla):
-    """
-    Devuelve un dict con la info de la tabla, o None si no se detecta.
-    """
-    # --- Plan A: buscar "UBICACI" (La Mantovana) ---
     idx_fila_ubicacion = None
     idx_col_ubicacion = None
 
@@ -447,7 +436,6 @@ def _detectar_tabla_y_items(tabla):
             break
 
     if idx_fila_ubicacion is not None:
-        # Modo La Mantovana (con columna de ubicación)
         fila_encabezado = tabla[idx_fila_ubicacion]
         items_por_col = {}
         for j, c in enumerate(fila_encabezado):
@@ -485,7 +473,6 @@ def _detectar_tabla_y_items(tabla):
             "columnas_total": columnas_total,
         }
 
-    # --- Plan B: buscar "LARGO" (EVA y otras) ---
     idx_fila_largo = None
     for i, fila in enumerate(tabla):
         celdas = [str(c).strip().upper() if c else "" for c in fila]
@@ -496,7 +483,6 @@ def _detectar_tabla_y_items(tabla):
     if idx_fila_largo is None:
         return None
 
-    # Buscamos los ítems en la fila del LARGO y en la de arriba (por si están separados)
     filas_a_mirar = []
     if idx_fila_largo - 1 >= 0:
         filas_a_mirar.append(tabla[idx_fila_largo - 1])
@@ -512,7 +498,6 @@ def _detectar_tabla_y_items(tabla):
     if not items_por_col:
         return None
 
-    # Buscamos "TOTAL" para alinear los ítems con la fila de totales
     columnas_total = []
     for i in range(idx_fila_largo + 1, len(tabla)):
         fila = tabla[i]
@@ -539,7 +524,7 @@ def _detectar_tabla_y_items(tabla):
     return {
         "modo": "largo",
         "idx_fila_ubicacion": idx_fila_largo,
-        "idx_col_ubicacion": 0,  # No hay columna de ubicación, usamos 0
+        "idx_col_ubicacion": 0,
         "columnas_total": columnas_total,
     }
 
@@ -555,7 +540,6 @@ def _procesar_tabla(tabla, info):
         return resultados
 
     for fila in tabla[idx_fila + 1:]:
-        # --- Excluir fila de TOTAL (en cualquier modo) ---
         es_total = False
         for c in fila:
             if c and str(c).strip().upper() == "TOTAL":
@@ -564,9 +548,7 @@ def _procesar_tabla(tabla, info):
         if es_total:
             continue
 
-        # --- Validación según el modo ---
         if modo == "ubicacion":
-            # Como La Mantovana: la columna de ubicación debe tener un número 1-3 dígitos
             if idx_col_ubic >= len(fila):
                 continue
             celda = fila[idx_col_ubic]
@@ -576,7 +558,6 @@ def _procesar_tabla(tabla, info):
             if not re.fullmatch(r"\d{1,3}", celda_str):
                 continue
         else:
-            # Modo "largo": la fila debe tener datos numéricos en alguna de las columnas de items
             tiene_datos = False
             for col in columnas_total:
                 idx_col = col["idx_col"]
@@ -588,7 +569,6 @@ def _procesar_tabla(tabla, info):
             if not tiene_datos:
                 continue
 
-        # --- Extraer valores ---
         for col in columnas_total:
             idx_col = col["idx_col"]
             item = col["item"]
@@ -627,6 +607,7 @@ def _procesar_pagina(pagina) -> dict:
         "care": None,
         "came": None,
         "calle": None,
+        "calle_norm": None,
         "alturas": [],
         "items": [],
         "pagina": pagina.page_number,
@@ -648,6 +629,7 @@ def _procesar_pagina(pagina) -> dict:
             calle = _extraer_calle(pagina, palabras, alturas, top_tabla)
             if calle:
                 resultado["calle"] = calle
+                resultado["calle_norm"] = _normalizar_calle_para_guardar(calle)
 
     resultado["items"] = _extraer_items_de_tablas(pagina)
     return resultado
