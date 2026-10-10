@@ -5005,6 +5005,14 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 
+    # Cargar traductor al español de Qt
+    from PyQt5.QtCore import QTranslator, QLibraryInfo, QLocale
+    translator = QTranslator()
+    locale = QLocale(QLocale.Spanish, QLocale.Argentina)
+    path = QLibraryInfo.location(QLibraryInfo.TranslationsPath)
+    if translator.load(locale, "qtbase", "_", path):
+        app.installTranslator(translator)
+
     win = ComparadorWindow()
     win.show()
     sys.exit(app.exec_())
